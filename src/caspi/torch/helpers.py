@@ -28,8 +28,6 @@ _ARROW_BATCH_SCHEMA = pa.schema([pa.field("batch", pa.binary())])
 def _arrow_batch_to_tensor_dict(
     record_batch: pa.RecordBatch,
     spark_schema: StructType,
-    record_batch: pa.RecordBatch,
-    spark_schema: StructType,
     tokenizer: Callable | None = None,
 ) -> TensorDict:
     """Converts a PyArrow RecordBatch to a dictionary of PyTorch tensors.

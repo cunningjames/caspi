@@ -156,7 +156,6 @@ class RebatchingDataset(IterableDataset):
 
 def loader(
     df: DataFrame,
-    df: DataFrame,
     batch_size: int,
     pin_memory_device: str = "",
     tokenizer: Callable | None = None,
