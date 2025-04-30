@@ -1,4 +1,5 @@
 """PyTorch loader interface for Spark DataFrames."""
+
 from collections import deque
 from collections.abc import Iterator
 from typing import Callable
@@ -42,6 +43,7 @@ class SparkArrowBatchDataset(IterableDataset):
                 columns. If provided, string columns will be tokenized and
                 represented as tensors based on the tokenizer's output.
         """
+
         _validate_df_schema(df, timestamp_to="int64", tokenizer=tokenizer)
         self._df = df
         self._spark_schema = df.schema
@@ -50,9 +52,7 @@ class SparkArrowBatchDataset(IterableDataset):
     def __iter__(self) -> Iterator[TensorDict]:
         # Convert PyArrow schema to string representation for Spark
         schema_str = str(_ARROW_BATCH_SCHEMA)
-        df_serialised = self._df.mapInArrow(
-            _serialise_batches, schema_str
-        )
+        df_serialised = self._df.mapInArrow(_serialise_batches, schema_str)
 
         for row in df_serialised.toLocalIterator():
             payload = row["batch"]

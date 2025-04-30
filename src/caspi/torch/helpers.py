@@ -1,4 +1,5 @@
 """Helper functions for PyTorch integration with Spark."""
+
 from collections.abc import Iterator
 from typing import Callable, Iterable
 
@@ -63,6 +64,7 @@ def _arrow_batch_to_tensor_dict(
             is encountered.
         AssertionError: If a StringType column is present but `tokenizer` is None.
     """
+
     tensors: TensorDict = {}
     if record_batch.num_rows == 0:
         return {}  # Handle empty batches
