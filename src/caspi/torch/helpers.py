@@ -96,10 +96,6 @@ def _arrow_batch_to_tensor_dict(
                         dtype=bool,
                     )
                     tensor_dtype = torch.bool
-                else:
-                    raise TypeError(
-                        f"Unsupported scalar type with NULLs for column '{col_name}'."
-                    )
             else:
                 # Normal primitive NumPy array branch
                 if np.issubdtype(np_array.dtype, np.floating):
@@ -426,6 +422,49 @@ def _serialise_batches(batches: Iterable[pa.RecordBatch]) -> Iterator[pa.RecordB
         # Create a new RecordBatch with one row, one column containing the payload
         array = pa.array([payload], type=pa.binary())
         yield pa.RecordBatch.from_arrays([array], schema=_ARROW_BATCH_SCHEMA)
+
+
+def _to_device(tensor_dict: TensorDict, device: str | torch.device | None) -> TensorDict:
+    """Moves all tensors in a TensorDict to the specified device.
+
+    Iterates through a dictionary of tensors or lists of tensors and moves each
+    element to the requested device. This function handles both direct torch.Tensor
+    values and lists of torch.Tensor values.
+
+    Args:
+        tensor_dict (TensorDict): The dictionary containing tensors or lists of
+            tensors to be moved to the device.
+        device (str | torch.device | None): The target device to move tensors to.
+            If None, the tensors will remain on their current devices.
+
+    Returns:
+        TensorDict: A new dictionary with the same keys but with all tensors
+            moved to the specified device.
+
+    Raises:
+        TypeError: If any value in the dictionary is not a torch.Tensor or a
+            list of torch.Tensor objects.
+    """
+    if device is None:
+        return tensor_dict
+
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    result: TensorDict = {}
+    for key, value in tensor_dict.items():
+        if isinstance(value, torch.Tensor):
+            result[key] = value.to(device)
+        elif isinstance(value, list):
+            # Handle list of tensors
+            result[key] = [
+                t.to(device) if isinstance(t, torch.Tensor) else t
+                for t in value
+            ]
+        else:
+            raise TypeError(f"Unsupported type for moving to device: {type(value)}")
+
+    return result
 
 
 def _validate_df_schema(

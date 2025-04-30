@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from typing import Callable
 
 import pyarrow as pa
+import torch
 
 from pyspark.sql import DataFrame
 from torch.utils.data import DataLoader, IterableDataset
@@ -16,6 +17,7 @@ from caspi.torch.helpers import (
     _get_tensor_dict_rows,
     _serialise_batches,
     _slice_tensor_dict,
+    _to_device,
     _validate_df_schema,
     _ARROW_BATCH_SCHEMA,
 )
@@ -68,20 +70,31 @@ class RebatchingDataset(IterableDataset):
 
     Pulls data from the source dataset, concatenates it, and yields
     batches of the desired size. Handles the final partial batch.
+    If a device is specified, all tensors are moved to that device
+    before being yielded.
     """
 
-    def __init__(self, source_dataset: IterableDataset[TensorDict], batch_size: int):
+    def __init__(
+        self, 
+        source_dataset: IterableDataset[TensorDict], 
+        batch_size: int,
+        device: str | torch.device | None = None,
+    ):
         """Initialize the RebatchingDataset.
 
         Args:
             source_dataset: The underlying dataset yielding TensorDict batches
                 (e.g., SparkArrowBatchDataset).
             batch_size: The desired fixed batch size to yield.
+            device (str | torch.device | None): Optional device to move tensors to.
+                If provided, all tensors in the yielded batches will be moved
+                to this device. Default is None (keep tensors on their original device).
         """
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
         self.source_dataset = source_dataset
         self.batch_size = batch_size
+        self.device = device
 
     def __iter__(self) -> Iterator[TensorDict]:
         """Iterate through the source dataset and yield fixed‑size batches.
@@ -91,6 +104,7 @@ class RebatchingDataset(IterableDataset):
         of incoming TensorDicts (`buffer_batches`) and splices only the rows
         required for the next output batch, concatenating *once per yield*.
         """
+        
         source_iter = iter(self.source_dataset)
         buffer_batches: deque[TensorDict] = deque()
         rows_in_buffer = 0
@@ -147,6 +161,10 @@ class RebatchingDataset(IterableDataset):
             for piece in to_concat:
                 output_batch = _concatenate_tensor_dicts(output_batch, piece)
 
+            # Move the batch to the specified device if necessary
+            if self.device is not None:
+                output_batch = _to_device(output_batch, self.device)
+
             yield output_batch
 
             # Terminate when no more data remains
@@ -157,8 +175,9 @@ class RebatchingDataset(IterableDataset):
 def loader(
     df: DataFrame,
     batch_size: int,
-    pin_memory_device: str = "",
     tokenizer: Callable | None = None,
+    device: str | torch.device | None = None,
+    pin_memory: bool = False,
 ) -> DataLoader[TensorDict]:
     """Creates a PyTorch DataLoader from a PySpark DataFrame.
 
@@ -174,11 +193,17 @@ def loader(
         df (DataFrame): The PySpark DataFrame to load data from.
         batch_size (int): The desired number of rows in each batch yielded by
             the DataLoader.
-        pin_memory_device (str): The device string (e.g., "cuda:0") to use for
-            `pin_memory` in the DataLoader. Defaults to "" (no pinning).
         tokenizer (Callable | None): An optional tokenizer function to process
             StringType columns in the DataFrame. If provided, string columns
             will be tokenized.
+        device (str | torch.device | None): Optional device to move tensors to
+            (e.g., "cuda:0", "cpu"). If provided, all tensors in the yielded 
+            batches will be moved to this device. Default is None (keep tensors 
+            on their original device).
+        pin_memory (bool): If True, enables pin_memory for the DataLoader.
+            This can improve performance when transferring data to CUDA devices.
+            Default is False. Note that this option is ignored if `device` is
+            set to "cpu".
 
     Returns:
         DataLoader[TensorDict]: A PyTorch DataLoader instance. It yields
@@ -189,15 +214,19 @@ def loader(
             so `num_workers` is set to 0. Shuffling is disabled due to the
             distributed nature of the data source.
     """
+    
     spark_dataset = SparkArrowBatchDataset(df, tokenizer=tokenizer)
-    rebatched_dataset = RebatchingDataset(spark_dataset, batch_size)
+    rebatched_dataset = RebatchingDataset(spark_dataset, batch_size, device=device)
+    
+    if device is None:
+        device = torch.device("cpu")
+    if isinstance(device, str): 
+        device = torch.device(device)
 
-    # batch_size=None for the DataLoader because RebatchingDataset handles batching.
-    # num_workers=0 is essential, parallelism is handled by Spark.
     return DataLoader(
         rebatched_dataset,
         batch_size=None,  # Batching is done by RebatchingDataset
         shuffle=False,  # Shuffling is complex with distributed source
         num_workers=0,  # Parallelism handled by Spark
-        pin_memory_device=pin_memory_device,
+        pin_memory=pin_memory if device.type != "cpu" else False,
     )
