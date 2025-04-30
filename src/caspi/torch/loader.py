@@ -21,18 +21,27 @@ from caspi.torch.helpers import (
 
 
 class SparkArrowBatchDataset(IterableDataset):
-    """Streams Arrow `RecordBatch` objects from Spark to the driver via only
-    public PySpark APIs, then converts them to `TensorDict`s.
+    """Streams Arrow `RecordBatch` objects from Spark to the driver.
+
+    Uses only public PySpark APIs (`mapInArrow`) to stream data efficiently
+    and then converts the received Arrow batches into `TensorDict`s suitable
+    for PyTorch models.
+
+    Attributes:
+        _df: The source PySpark DataFrame.
+        _spark_schema: The schema of the source DataFrame.
+        _tokenizer: An optional callable used to tokenize string columns.
     """
 
-    def __init__(self, df: DataFrame, tokenizer: Callable | None = None):
-        """Initialize a SparkArrowBatchDataset.
-        
-        Args:
-            df: Source PySpark `DataFrame`.
-            tokenizer: Optional tokenizer for StringType columns.
-        """
+    def __init__(self, df: DataFrame, tokenizer: Callable | None = None) -> None:
+        """Initializes the SparkArrowBatchDataset.
 
+        Args:
+            df (DataFrame): The source PySpark `DataFrame`.
+            tokenizer (Callable | None): An optional tokenizer for StringType
+                columns. If provided, string columns will be tokenized and
+                represented as tensors based on the tokenizer's output.
+        """
         _validate_df_schema(df, timestamp_to="int64", tokenizer=tokenizer)
         self._df = df
         self._spark_schema = df.schema
@@ -147,26 +156,40 @@ class RebatchingDataset(IterableDataset):
 
 def loader(
     df: DataFrame,
+    df: DataFrame,
     batch_size: int,
     pin_memory_device: str = "",
     tokenizer: Callable | None = None,
 ) -> DataLoader[TensorDict]:
-    """Create a Torch DataLoader from a PySpark DataFrame using `mapInArrow`.
+    """Creates a PyTorch DataLoader from a PySpark DataFrame.
 
-    This version ensures that the DataLoader yields batches of the specified
-    `batch_size`, handling partial batches at the end.
+    This function sets up a data loading pipeline that:
+    1. Uses `SparkArrowBatchDataset` to efficiently stream data from Spark
+       executors to the driver using `mapInArrow`.
+    2. Wraps the stream with `RebatchingDataset` to ensure that the data is
+       yielded in batches of the specified `batch_size`.
+    3. Configures a `torch.utils.data.DataLoader` to manage the final data
+       stream, ready for consumption by a PyTorch model.
 
     Args:
-        df: PySpark DataFrame to load.
-        batch_size: The desired size for batches yielded by the DataLoader.
-        pin_memory_device: Device string for DataLoader's pin_memory.
-        tokenizer: Optional tokenizer for StringType columns.
+        df (DataFrame): The PySpark DataFrame to load data from.
+        batch_size (int): The desired number of rows in each batch yielded by
+            the DataLoader.
+        pin_memory_device (str): The device string (e.g., "cuda:0") to use for
+            `pin_memory` in the DataLoader. Defaults to "" (no pinning).
+        tokenizer (Callable | None): An optional tokenizer function to process
+            StringType columns in the DataFrame. If provided, string columns
+            will be tokenized.
 
     Returns:
-        DataLoader yielding dicts mapping column names to torch.Tensor or
-        list[torch.Tensor] batches processed distributively and then re-batched.
+        DataLoader[TensorDict]: A PyTorch DataLoader instance. It yields
+            dictionaries (`TensorDict`) where keys are column names (or derived
+            names for tokenized strings) and values are `torch.Tensor` or
+            `list[torch.Tensor]`. The batches produced will have `batch_size`
+            rows, except possibly the last one. Parallelism is handled by Spark,
+            so `num_workers` is set to 0. Shuffling is disabled due to the
+            distributed nature of the data source.
     """
-
     spark_dataset = SparkArrowBatchDataset(df, tokenizer=tokenizer)
     rebatched_dataset = RebatchingDataset(spark_dataset, batch_size)
 

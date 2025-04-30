@@ -28,19 +28,43 @@ _ARROW_BATCH_SCHEMA = pa.schema([pa.field("batch", pa.binary())])
 def _arrow_batch_to_tensor_dict(
     record_batch: pa.RecordBatch,
     spark_schema: StructType,
+    record_batch: pa.RecordBatch,
+    spark_schema: StructType,
     tokenizer: Callable | None = None,
 ) -> TensorDict:
-    """Converts a pyarrow.RecordBatch to a dictionary of tensors.
+    """Converts a PyArrow RecordBatch to a dictionary of PyTorch tensors.
+
+    This function iterates through the columns of an Arrow RecordBatch,
+    converting each column into a PyTorch tensor or a list of tensors based
+    on the corresponding Spark data type defined in `spark_schema`. It handles
+    various data types including numeric, boolean, timestamp, string (with
+    optional tokenization), and arrays of primitives. Special care is taken
+    to handle null values appropriately for each type.
 
     Args:
-        record_batch: Input Arrow RecordBatch.
-        spark_schema: Original Spark DataFrame schema to interpret types.
-        tokenizer: Optional tokenizer used to process StringType columns.
+        record_batch (pa.RecordBatch): The input Arrow RecordBatch.
+        spark_schema (StructType): The original Spark DataFrame schema, used to
+            determine the correct data type for each column.
+        tokenizer (Callable | None): An optional tokenizer function. If provided
+            and a StringType column is encountered, this function is used to
+            convert the strings into tokenized tensors. The resulting tensors
+            (e.g., 'input_ids', 'attention_mask') are added to the output
+            dictionary with keys prefixed by the original column name.
 
     Returns:
-        A dictionary mapping column names to torch tensors or lists of tensors.
-    """
+        TensorDict: A dictionary where keys are column names (or derived names
+            for tokenized strings) and values are either `torch.Tensor` (for
+            scalar types, timestamps, tokenized strings) or `list[torch.Tensor]`
+            (for array types). Returns an empty dictionary if the input
+            `record_batch` has zero rows.
 
+    Raises:
+        TypeError: If a column contains a data type that is not supported for
+            conversion (e.g., complex structs, maps) or if an unexpected
+            intermediate type (like NumPy object array for non-numeric/bool)
+            is encountered.
+        AssertionError: If a StringType column is present but `tokenizer` is None.
+    """
     tensors: TensorDict = {}
     if record_batch.num_rows == 0:
         return {}  # Handle empty batches
@@ -172,24 +196,36 @@ def _arrow_batch_to_tensor_dict(
 
 
 def _concatenate_tensor_dicts(dict1: TensorDict, dict2: TensorDict) -> TensorDict:
-    """Concatenates two TensorDicts along the batch dimension.
+    """Concatenates two TensorDicts along the batch dimension (dim=0).
 
-    Assumes keys are the same in both dictionaries.
-    Handles torch.Tensor and list[torch.Tensor].
+    Merges the tensors or lists of tensors from `dict2` into `dict1` for each
+    corresponding key. It handles both `torch.Tensor` values (concatenated using
+    `torch.cat`) and `list[torch.Tensor]` values (by extending the list).
+
+    If tensors have differing trailing dimensions (e.g., sequence lengths in
+    NLP tasks), it pads the shorter tensor along the trailing dimensions before
+    concatenation. Device compatibility is handled by moving tensors from `dict2`
+    to the device of the corresponding tensor in `dict1` if necessary.
 
     Args:
-        dict1: The first TensorDict (can be empty).
-        dict2: The second TensorDict.
+        dict1 (TensorDict): The first TensorDict. Can be empty, in which case
+            a copy of `dict2` is returned.
+        dict2 (TensorDict): The second TensorDict to concatenate onto the first.
+            Can be empty, in which case a copy of `dict1` is returned.
 
     Returns:
-        A new TensorDict containing the concatenated data.
+        TensorDict: A new dictionary containing the concatenated tensors or
+            lists of tensors.
 
     Raises:
-        ValueError: If keys don't match or concatenation fails.
+        ValueError: If `dict1` and `dict2` are non-empty and have different
+            sets of keys.
+        TypeError: If the values associated with the same key in `dict1` and
+            `dict2` have incompatible types (e.g., one is a Tensor and the
+            other is a list) or are of an unsupported type for concatenation.
     """
-
     if not dict1:
-        return dict2.copy()  # Return a copy to avoid modifying original
+        return dict2.copy()
     if not dict2:
         return dict1.copy()
 
@@ -260,17 +296,25 @@ def _concatenate_tensor_dicts(dict1: TensorDict, dict2: TensorDict) -> TensorDic
 
 
 def _slice_tensor_dict(tensor_dict: TensorDict, start: int, end: int) -> TensorDict:
-    """Slices a TensorDict along the batch dimension.
+    """Slices all tensors or lists within a TensorDict along the batch dimension.
+
+    Creates a new TensorDict where each value (torch.Tensor or list) is a
+    slice of the corresponding value in the input `tensor_dict`. The slice
+    is taken along the first dimension (axis 0), representing the batch dimension.
 
     Args:
-        tensor_dict: The TensorDict to slice.
-        start: The starting index (inclusive).
-        end: The ending index (exclusive).
+        tensor_dict (TensorDict): The dictionary of tensors or lists of tensors
+            to slice.
+        start (int): The starting index for the slice (inclusive).
+        end (int): The ending index for the slice (exclusive).
 
     Returns:
-        A new TensorDict containing the sliced data.
-    """
+        TensorDict: A new dictionary containing the sliced tensors or lists.
 
+    Raises:
+        TypeError: If any value in `tensor_dict` is not a `torch.Tensor` or a
+            `list`.
+    """
     sliced: TensorDict = {}
     for key, value in tensor_dict.items():
         if isinstance(value, torch.Tensor):
@@ -283,18 +327,27 @@ def _slice_tensor_dict(tensor_dict: TensorDict, start: int, end: int) -> TensorD
 
 
 def _get_tensor_dict_rows(tensor_dict: TensorDict) -> int:
-    """Gets the number of rows (batch size) in a TensorDict.
+    """Determines the number of rows (batch size) in a TensorDict.
+
+    Checks the size of the first dimension of `torch.Tensor` values or the
+    length of `list` values. It assumes all values in the dictionary represent
+    the same batch and therefore should have the same size along the first
+    dimension.
 
     Args:
-        tensor_dict: The TensorDict.
+        tensor_dict (TensorDict): The dictionary containing tensors or lists
+            of tensors.
 
     Returns:
-        The number of rows. Returns 0 for an empty dict.
+        int: The number of rows (batch size). Returns 0 if the input dictionary
+             is empty.
 
     Raises:
-        ValueError: If the dict is inconsistent or empty.
+        ValueError: If the `tensor_dict` is not empty but contains values with
+            inconsistent first dimension sizes (batch sizes) or if it's non-empty
+            but a row count cannot be determined (e.g., contains unsupported types).
+        TypeError: If a value in the dictionary is not a `torch.Tensor` or `list`.
     """
-
     if not tensor_dict:
         return 0
 
@@ -324,21 +377,53 @@ def _get_tensor_dict_rows(tensor_dict: TensorDict) -> int:
 
 
 def _record_batch_to_ipc_bytes(rb: pa.RecordBatch) -> bytes:
-    """Wrap one RecordBatch in a self-contained IPC stream (schema + batch)."""
+    """Serializes a single PyArrow RecordBatch into the Arrow IPC stream format.
 
+    This creates a self-contained binary payload that includes both the schema
+    and the data for the given RecordBatch. This format is suitable for sending
+    the batch over a network or storing it.
+
+    Args:
+        rb (pa.RecordBatch): The PyArrow RecordBatch to serialize.
+
+    Returns:
+        bytes: A bytes object containing the serialized RecordBatch in Arrow
+               IPC stream format.
+    """
     sink = pa.BufferOutputStream()
+    # Use new_stream to include schema with the batch
     with pa.ipc.new_stream(sink, rb.schema) as writer:
         writer.write_batch(rb)
     return sink.getvalue().to_pybytes()
 
 
-def _serialise_batches(
-    batches: Iterable[pa.RecordBatch],
-) -> Iterator[pa.RecordBatch]:
-    """Arrow-to-Arrow UDF: emits one-row RecordBatches with IPC-encoded payloads."""
+def _serialise_batches(batches: Iterable[pa.RecordBatch]) -> Iterator[pa.RecordBatch]:
+    """Serializes an iterable of RecordBatches for Spark's mapInArrow.
 
+    This function takes an iterator yielding PyArrow RecordBatches (as provided
+    by Spark's `mapInArrow` input function) and transforms it into an iterator
+    yielding new RecordBatches. Each output RecordBatch contains a single row
+    and a single column named "batch". The value in this column is the
+    binary Arrow IPC stream representation of one of the input RecordBatches,
+    generated by `_record_batch_to_ipc_bytes`.
+
+    This structure is required by the `mapInArrow` pattern where the UDF must
+    return an iterator of RecordBatches conforming to the specified output schema
+    (`_ARROW_BATCH_SCHEMA`).
+
+    Args:
+        batches (Iterable[pa.RecordBatch]): An iterable of PyArrow RecordBatches
+            as input from Spark.
+
+    Yields:
+        Iterator[pa.RecordBatch]: An iterator producing RecordBatches, each
+            containing one row with a single binary column "batch" holding
+            the serialized data of an input RecordBatch.
+    """
     for rb in batches:
+        # Serialize each input batch into IPC bytes
         payload = _record_batch_to_ipc_bytes(rb)
+        # Create a new RecordBatch with one row, one column containing the payload
         array = pa.array([payload], type=pa.binary())
         yield pa.RecordBatch.from_arrays([array], schema=_ARROW_BATCH_SCHEMA)
 
@@ -346,21 +431,32 @@ def _serialise_batches(
 def _validate_df_schema(
     df: DataFrame, timestamp_to: str | None = None, tokenizer: Callable | None = None
 ) -> None:
-    """Validate that df schema contains only types convertible to numpy/tensor.
+    """Validates if a Spark DataFrame's schema is compatible with tensor conversion.
+
+    Checks each column in the DataFrame's schema to ensure its data type is
+    supported for conversion into PyTorch tensors by the `_arrow_batch_to_tensor_dict`
+    function. Supported types include Numeric, Boolean, Timestamp (if `timestamp_to`
+    is specified), String (if `tokenizer` is provided), and Arrays of these
+    primitive types (currently only one level deep).
 
     Args:
-        df: PySpark DataFrame to validate.
-        timestamp_to: Optional target dtype for Spark `TimestampType` columns.
-            If None (default), timestamp columns are rejected. Supported values:
-            "int64" (epoch-nanoseconds) or "float64" (epoch-seconds).
-        tokenizer: Optional tokenizer to allow StringType columns.
+        df (DataFrame): The PySpark DataFrame whose schema needs validation.
+        timestamp_to (str | None): Specifies how to handle Spark `TimestampType`
+            columns. If "int64", timestamps are converted to nanoseconds since
+            epoch. If None (default), TimestampType columns are considered
+            unsupported. Other values are currently not supported.
+        tokenizer (Callable | None): A tokenizer function. If provided, columns
+            of `StringType` are considered supported. If None, `StringType`
+            columns are considered unsupported.
 
     Raises:
-        ValueError: If a column has unsupported type for tensor conversion.
+        ValueError: If any column in the DataFrame has a data type that is not
+            supported according to the specified rules (e.g., StructType, MapType,
+            StringType without a tokenizer, TimestampType without `timestamp_to`,
+            nested arrays beyond one level, or arrays of unsupported types).
     """
-
     allowed_array_element_types: tuple[type, ...] = (NumericType, BooleanType)
-    if timestamp_to is not None:
+    if timestamp_to == "int64":  # Be specific about supported conversion
         allowed_array_element_types += (TimestampType,)
 
     for field in df.schema.fields:
