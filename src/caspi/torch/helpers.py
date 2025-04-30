@@ -117,25 +117,13 @@ def _arrow_batch_to_tensor_dict(
             # Convert Arrow Timestamp array to numpy array
             np_array = arrow_array.to_numpy(zero_copy_only=False)
 
-            # Handle potential object dtype if nulls are present within the batch
-            if np_array.dtype == object:
-                py_list3 = arrow_array.to_pylist()
-                # Convert datetime objects to int64 nanoseconds, handle None (using 0 like NullArray case)
-                np_array = np.array(
-                    [
-                        int(x.timestamp() * 1e9) if x is not None else 0
-                        for x in py_list3
-                    ],
-                    dtype=np.int64,
+            # Convert numpy datetime64 to int64 nanoseconds
+            if not np.issubdtype(np_array.dtype, np.datetime64):
+                raise TypeError(
+                    f"Expected numpy datetime64 array for column '{col_name}', got {np_array.dtype}"
                 )
-            else:
-                # Convert numpy datetime64 to int64 nanoseconds
-                if not np.issubdtype(np_array.dtype, np.datetime64):
-                    raise TypeError(
-                        f"Expected numpy datetime64 array for column '{col_name}', got {np_array.dtype}"
-                    )
-                # Ensure nanosecond precision before converting to int64
-                np_array = np_array.astype("datetime64[ns]").astype(np.int64)
+            # Ensure nanosecond precision before converting to int64
+            np_array = np_array.astype("datetime64[ns]").astype(np.int64)
 
             # Convert numpy array to torch tensor
             tensor = torch.from_numpy(np_array).to(torch.int64)

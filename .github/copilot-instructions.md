@@ -5,6 +5,7 @@
   - Use the syntax `SomeType | None` rather than `Optional[SomeType]`.
   - Use the syntax `TypeA | TypeB` rather than `Union[TypeA, TypeB]`.
 - Never add comments using the `#` syntax. When necessary, difficult logic should be explained in the relevant docstring.
+- The Python environment is managed by uv. To run a Python script, use the command `uv run <script_name>`. For example, to run unit tests, run `uv run pytest`.
 
 Python example:
 
