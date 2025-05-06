@@ -32,6 +32,9 @@ from caspi.torch.helpers import (
     _get_tensor_dict_rows,
     _slice_tensor_dict,
     _validate_df_schema,
+    _to_device,
+    _serialise_batches,
+    _ARROW_BATCH_SCHEMA,
 )
 
 # --- Helper Functions/Classes ---
@@ -164,6 +167,47 @@ def complex_df(spark: SparkSession, complex_schema: StructType) -> DataFrame:
         (5, 5.5, False, "baz", [7, 8], [7.0], datetime(2025, 1, 5, 12, 0, 0)),
     ]
     return spark.createDataFrame(data, schema=complex_schema)
+
+
+@pytest.fixture
+def shuffle_test_df(spark: SparkSession) -> DataFrame:
+    """Creates a DataFrame for testing shuffling.
+
+    Args:
+        spark: The SparkSession fixture.
+
+    Returns:
+        DataFrame: A DataFrame with a single 'id' column.
+    """
+    data = [(i,) for i in range(20)]  # IDs from 0 to 19
+    return spark.createDataFrame(data, schema="id INT")
+
+
+def _get_ids_from_epoch(dataset: SparkArrowBatchDataset) -> torch.Tensor:
+    """Collects all 'id' tensors from a single iteration of the dataset.
+
+    Args:
+        dataset: The SparkArrowBatchDataset instance.
+
+    Returns:
+        torch.Tensor: A concatenated tensor of all 'id's from one epoch.
+    """
+    batches = list(dataset)
+    if not batches:
+        return torch.empty(0, dtype=torch.int64)
+    
+    all_ids: list[torch.Tensor] = []
+    for b in batches:
+        if "id" in b and isinstance(b["id"], torch.Tensor):
+            all_ids.append(b["id"])
+        elif "id" in b and isinstance(b["id"], list): # Handle cases where 'id' might be a list of tensors
+            for item in b["id"]:
+                if isinstance(item, torch.Tensor):
+                    all_ids.append(item)
+
+    if not all_ids:
+        return torch.empty(0, dtype=torch.int64)
+    return torch.cat(all_ids)
 
 
 # --- Test Functions ---
@@ -564,6 +608,74 @@ def test_rebatching_dataset_skip_empty_batches() -> None:
     assert torch.equal(cast(torch.Tensor, batches[0]["a"]), torch.tensor([1, 2, 3]))
     assert torch.equal(cast(torch.Tensor, batches[1]["a"]), torch.tensor([4, 5, 6]))
     assert source_dataset.iter_count == 1
+
+
+def test_spark_arrow_batch_dataset_shuffle(shuffle_test_df: DataFrame) -> None:
+    """Tests SparkArrowBatchDataset shuffling behavior across epochs.
+
+    Covers:
+    - No shuffling.
+    - Shuffling with no seed (random order each epoch).
+    - Shuffling with a fixed seed (same order each epoch).
+
+    Args:
+        shuffle_test_df (DataFrame): A DataFrame with an 'id' column.
+    """
+    original_ids = torch.arange(20, dtype=torch.int64)
+
+    # Scenario 1: shuffle_per_epoch = False (no shuffle)
+    dataset_no_shuffle = SparkArrowBatchDataset(
+        shuffle_test_df, shuffle_per_epoch=False
+    )
+    ids_epoch1_no_shuffle = _get_ids_from_epoch(dataset_no_shuffle)
+    ids_epoch2_no_shuffle = _get_ids_from_epoch(dataset_no_shuffle)
+
+    assert torch.equal(
+        ids_epoch1_no_shuffle, original_ids
+    ), "Epoch 1 without shuffle should match original order."
+    assert torch.equal(
+        ids_epoch1_no_shuffle, ids_epoch2_no_shuffle
+    ), "Order should be consistent across epochs when shuffle_per_epoch is False."
+
+    # Scenario 2: shuffle_per_epoch = True, random_seed = None
+    dataset_shuffle_no_seed = SparkArrowBatchDataset(
+        shuffle_test_df, shuffle_per_epoch=True, random_seed=None
+    )
+    ids_epoch1_shuffle_no_seed = _get_ids_from_epoch(dataset_shuffle_no_seed)
+    ids_epoch2_shuffle_no_seed = _get_ids_from_epoch(dataset_shuffle_no_seed)
+
+    assert len(ids_epoch1_shuffle_no_seed) == len(original_ids)
+    assert sorted(ids_epoch1_shuffle_no_seed.tolist()) == original_ids.tolist(), \
+        "Epoch 1 with random shuffle should contain all original IDs."
+    assert len(ids_epoch2_shuffle_no_seed) == len(original_ids)
+    assert sorted(ids_epoch2_shuffle_no_seed.tolist()) == original_ids.tolist(), \
+        "Epoch 2 with random shuffle should contain all original IDs."
+
+    assert not torch.equal(
+        ids_epoch1_shuffle_no_seed, original_ids
+    ), "Randomly shuffled order should differ from original (high probability)."
+    assert not torch.equal(
+        ids_epoch1_shuffle_no_seed, ids_epoch2_shuffle_no_seed
+    ), "Order should be different across epochs with random shuffle (high probability)."
+
+    # Scenario 3: shuffle_per_epoch = True, random_seed = 42
+    fixed_seed = 42
+    dataset_shuffle_with_seed = SparkArrowBatchDataset(
+        shuffle_test_df, shuffle_per_epoch=True, random_seed=fixed_seed
+    )
+    ids_epoch1_shuffle_seed = _get_ids_from_epoch(dataset_shuffle_with_seed)
+    ids_epoch2_shuffle_seed = _get_ids_from_epoch(dataset_shuffle_with_seed)
+
+    assert len(ids_epoch1_shuffle_seed) == len(original_ids)
+    assert sorted(ids_epoch1_shuffle_seed.tolist()) == original_ids.tolist(), \
+        "Epoch 1 with seeded shuffle should contain all original IDs."
+    
+    assert torch.equal(
+        ids_epoch1_shuffle_seed, ids_epoch2_shuffle_seed
+    ), "Order should be consistent across epochs with a fixed seed."
+    assert not torch.equal(
+        ids_epoch1_shuffle_seed, original_ids
+    ), "Seeded shuffle order should differ from original (high probability)."
 
 
 def test_loader_integration(simple_df: DataFrame) -> None:
@@ -1129,3 +1241,148 @@ def test_loader_with_string_array_column(spark: SparkSession) -> None:
     assert isinstance(batches[0]["texts"][0], dict)
     assert "input_ids" in batches[0]["texts"][0]
     assert "attention_mask" in batches[0]["texts"][0]
+    
+    
+def test_to_device() -> None:
+    """Tests the _to_device helper function."""
+    initial_device_str = "cpu"  # Assuming CPU is always available
+    initial_device = torch.device(initial_device_str)
+    target_device_str = "cpu"  # Test with CPU, can be changed if CUDA is available
+    target_device = torch.device(target_device_str)
+
+    tensor_dict_original: TensorDict = {
+        "a": torch.tensor([1, 2, 3], device=initial_device),
+        "b": [
+            torch.tensor([4, 5], device=initial_device),
+            torch.tensor([6], device=initial_device),
+        ],
+        "c": torch.tensor([[7.0, 8.0]], device=initial_device),
+    }
+
+    # Test moving to the target device
+    moved_dict = _to_device(tensor_dict_original, target_device_str)
+    assert isinstance(moved_dict["a"], torch.Tensor)
+    assert moved_dict["a"].device == target_device
+    assert torch.equal(
+        cast(torch.Tensor, moved_dict["a"]),
+        cast(torch.Tensor, tensor_dict_original["a"]),
+    )
+
+    assert isinstance(moved_dict["b"], list)
+    for tensor in cast(list[torch.Tensor], moved_dict["b"]):
+        assert tensor.device == target_device
+    assert torch.equal(
+        cast(list[torch.Tensor], moved_dict["b"])[0],
+        cast(list[torch.Tensor], tensor_dict_original["b"])[0],
+    )
+    assert torch.equal(
+        cast(list[torch.Tensor], moved_dict["b"])[1],
+        cast(list[torch.Tensor], tensor_dict_original["b"])[1],
+    )
+
+    assert isinstance(moved_dict["c"], torch.Tensor)
+    assert moved_dict["c"].device == target_device
+    assert torch.equal(
+        cast(torch.Tensor, moved_dict["c"]),
+        cast(torch.Tensor, tensor_dict_original["c"]),
+    )
+
+    # Test with device=None (should return original)
+    no_move_dict = _to_device(tensor_dict_original, None)
+    assert no_move_dict["a"].device == initial_device
+    for tensor in cast(list[torch.Tensor], no_move_dict["b"]):
+        assert tensor.device == initial_device
+    assert no_move_dict["c"].device == initial_device
+
+    # Test with torch.device object
+    moved_dict_obj = _to_device(tensor_dict_original, target_device)
+    assert moved_dict_obj["a"].device == target_device
+
+    # Test with unsupported type
+    unsupported_dict: TensorDict = {"d": "not a tensor or list"}  # type: ignore
+    with pytest.raises(TypeError, match="Unsupported type for moving to device"):
+        _to_device(unsupported_dict, target_device_str)
+
+    # Test with an empty dict
+    empty_dict: TensorDict = {}
+    moved_empty_dict = _to_device(empty_dict, target_device_str)
+    assert len(moved_empty_dict) == 0
+
+    # Test with list of non-tensor items (should pass through)
+    mixed_list_dict: TensorDict = {
+        "e": [torch.tensor([1]), "string", torch.tensor([2])] # type: ignore
+    }
+    moved_mixed_list_dict = _to_device(mixed_list_dict, target_device_str)
+    assert cast(list, moved_mixed_list_dict["e"])[0].device == target_device
+    assert cast(list, moved_mixed_list_dict["e"])[1] == "string"
+    assert cast(list, moved_mixed_list_dict["e"])[2].device == target_device
+
+
+def test_serialise_batches() -> None:
+    """Tests the _serialise_batches helper function.
+
+    This test verifies that _serialise_batches correctly serializes an
+    iterable of PyArrow RecordBatches into the expected IPC stream format,
+    wrapped in new RecordBatches.
+    """
+    data1 = [pa.array([1, 2, 3]), pa.array(["a", "b", "c"])]
+    rb1 = pa.RecordBatch.from_arrays(data1, names=["col1", "col2"])
+
+    data2 = [pa.array([4, 5]), pa.array(["d", "e"])]
+    rb2 = pa.RecordBatch.from_arrays(data2, names=["col1", "col2"])
+
+    empty_rb = pa.RecordBatch.from_arrays([], schema=pa.schema([]))
+
+    input_batches_list: list[list[pa.RecordBatch]] = [
+        [],
+        [rb1],
+        [rb1, rb2],
+        [empty_rb],
+        [rb1, empty_rb, rb2],
+    ]
+
+    for input_batches in input_batches_list:
+        serialized_iter = _serialise_batches(iter(input_batches))
+        output_rbs = list(serialized_iter)
+
+        assert len(output_rbs) == len(input_batches)
+
+        for original_rb, serial_rb in zip(input_batches, output_rbs):
+            assert serial_rb.schema.equals(_ARROW_BATCH_SCHEMA)
+            assert serial_rb.num_rows == 1
+            assert serial_rb.num_columns == 1
+            assert serial_rb.column_names[0] == "batch"
+            assert serial_rb.column(0).type == pa.binary()
+
+            # Deserialize the payload and check if it matches the original
+            payload = serial_rb.column(0)[0].as_py()
+            assert isinstance(payload, bytes)
+
+            # The _record_batch_to_ipc_bytes includes the schema in the stream
+            # so we can read it back directly.
+            with pa.ipc.open_stream(payload) as reader:
+                deserialized_rb = reader.read_all()
+
+            assert deserialized_rb.equals(pa.Table.from_batches([original_rb]))
+
+    # Test with an iterator that can only be consumed once
+    input_gen = (rb for rb in [rb1, rb2])
+    serialized_iter_gen = _serialise_batches(input_gen)
+    output_rbs_gen = list(serialized_iter_gen)
+    assert len(output_rbs_gen) == 2
+
+    # Check content of the first batch from generator
+    original_rb_gen1 = rb1
+    serial_rb_gen1 = output_rbs_gen[0]
+    payload_gen1 = serial_rb_gen1.column(0)[0].as_py()
+    with pa.ipc.open_stream(payload_gen1) as reader:
+        deserialized_rb_gen1 = reader.read_all()
+    assert deserialized_rb_gen1.equals(pa.Table.from_batches([original_rb_gen1]))
+
+    # Check content of the second batch from generator
+    original_rb_gen2 = rb2
+    serial_rb_gen2 = output_rbs_gen[1]
+    payload_gen2 = serial_rb_gen2.column(0)[0].as_py()
+    with pa.ipc.open_stream(payload_gen2) as reader:
+        deserialized_rb_gen2 = reader.read_all()
+    assert deserialized_rb_gen2.equals(pa.Table.from_batches([original_rb_gen2]))

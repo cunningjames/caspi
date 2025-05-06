@@ -383,8 +383,6 @@ def _get_tensor_dict_rows(tensor_dict: TensorDict) -> int:
             )
 
     if rows == -1:
-        # This case should ideally not be reached if tensor_dict is not empty
-        # and contains supported types, but added for robustness.
         raise ValueError("Could not determine row count from non-empty TensorDict.")
     return rows
 
