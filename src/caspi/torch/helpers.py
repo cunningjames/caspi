@@ -158,6 +158,30 @@ def _arrow_batch_to_tensor_dict(
                 empty_dtype = torch.bool
             elif isinstance(inner_type, TimestampType):
                 empty_dtype = torch.int64
+            elif isinstance(inner_type, StringType):
+                # For string arrays, we need special handling
+                assert tokenizer is not None, (
+                    "Tokenizer must be provided for StringType arrays."
+                )
+                
+                # Process each array separately
+                for item in arrow_array.to_pylist():
+                    if item is None:
+                        # For null arrays, add an empty tensor
+                        processed_list.append(torch.empty(0, dtype=torch.float32))
+                    else:
+                        # Convert None to empty string and apply tokenizer
+                        item_texts = ["" if x is None else str(x) for x in item]
+                        encodings = tokenizer(
+                            item_texts,
+                            padding="longest",
+                            truncation=True,
+                            return_tensors="pt",
+                        )
+                        processed_list.append(encodings)
+                
+                tensors[col_name] = processed_list
+                continue  # Skip the rest of the processing for this column
             else:
                 empty_dtype = torch.float32
 
@@ -252,25 +276,30 @@ def _concatenate_tensor_dicts(dict1: TensorDict, dict2: TensorDict) -> TensorDic
                 val2 = val2.to(target_device)
             concatenated[key] = torch.cat((val1, val2), dim=0)
         elif isinstance(val1, list) and isinstance(val2, list):
-            # Harmonise devices for each tensor within the lists
-            target_device = (
-                val1[0].device
-                if val1
-                else (val2[0].device if val2 else torch.device("cpu"))
-            )
-            val1_conv = [
-                t.to(target_device)
-                if isinstance(t, torch.Tensor) and t.device != target_device
-                else t
-                for t in val1
-            ]
-            val2_conv = [
-                t.to(target_device)
-                if isinstance(t, torch.Tensor) and t.device != target_device
-                else t
-                for t in val2
-            ]
-            concatenated[key] = val1_conv + val2_conv
+            # Check if we have lists of dictionary items (tokenized string arrays)
+            if val1 and isinstance(val1[0], dict) and val2 and isinstance(val2[0], dict):
+                # For tokenizer outputs (dictionaries), combine the lists
+                concatenated[key] = val1 + val2
+            else:
+                # Harmonise devices for each tensor within the lists
+                target_device = (
+                    val1[0].device
+                    if val1
+                    else (val2[0].device if val2 else torch.device("cpu"))
+                )
+                val1_conv = [
+                    t.to(target_device)
+                    if isinstance(t, torch.Tensor) and t.device != target_device
+                    else t
+                    for t in val1
+                ]
+                val2_conv = [
+                    t.to(target_device)
+                    if isinstance(t, torch.Tensor) and t.device != target_device
+                    else t
+                    for t in val2
+                ]
+                concatenated[key] = val1_conv + val2_conv
         else:
             raise TypeError(
                 f"Type mismatch or unsupported type for key '{key}': "
@@ -499,6 +528,10 @@ def _validate_df_schema(
         if isinstance(dt, ArrayType):
             element_type = dt.elementType
             if isinstance(element_type, allowed_array_element_types):
+                continue
+            
+            # Allow array of strings if tokenizer is provided
+            if isinstance(element_type, StringType) and tokenizer is not None:
                 continue
 
             # Example: Allow Array<Array<Numeric>>

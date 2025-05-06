@@ -1103,12 +1103,29 @@ def test_loader_with_string_array_column(spark: SparkSession) -> None:
     # Create tokenizer
     tokenizer = DummyTokenizer()
     
-    # This will raise a ValueError with the current implementation 
-    # because arrays of StringType are not supported
-    with pytest.raises(ValueError, match="unsupported type"):
-        data_loader = loader(df, batch_size=2, tokenizer=tokenizer)
-        
-    # The test would need to be updated if string array support is added
-    # If implemented, we could collect and verify batches:
-    # batches = list(data_loader)
-    # assert len(batches) == 3  # 5 rows with batch_size=2 should yield 3 batches
+    # With our implementation, arrays of StringType are now supported
+    data_loader = loader(df, batch_size=2, tokenizer=tokenizer)
+    
+    # Collect and verify batches
+    batches = list(data_loader)
+    
+    # 5 rows with batch_size=2 should yield 3 batches
+    assert len(batches) == 3
+    
+    # Check that the ID column is correctly processed
+    all_ids = torch.cat([b["id"] for b in batches])
+    assert torch.equal(all_ids, torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64))
+    
+    # Check that the string array column is processed correctly
+    # The texts column should be a list of tokenizer outputs (dictionaries)
+    assert "texts" in batches[0]
+    assert isinstance(batches[0]["texts"], list)
+    
+    # First batch should have 2 items
+    assert len(batches[0]["texts"]) == 2
+    
+    # For the first row (id=1), the texts "hello" and "world" should be tokenized
+    # Each tokenized output should be a dictionary with input_ids and attention_mask
+    assert isinstance(batches[0]["texts"][0], dict)
+    assert "input_ids" in batches[0]["texts"][0]
+    assert "attention_mask" in batches[0]["texts"][0]

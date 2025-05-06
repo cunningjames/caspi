@@ -8,7 +8,7 @@ import pytest
 import torch
 from pyspark.sql.types import (
     ArrayType, BooleanType, DoubleType, FloatType, IntegerType, LongType,
-    NumericType, ShortType, StructField, StructType, TimestampType,
+    StructField, StructType, TimestampType,
 )
 
 from caspi.torch.helpers import _arrow_batch_to_tensor_dict
@@ -70,7 +70,7 @@ def test_arrow_batch_to_tensor_dict_unsupported_dtype() -> None:
     # Mock np.issubdtype to always return False to trigger the unsupported dtype error
     original_issubdtype = np.issubdtype
     
-    def mock_issubdtype(dtype, dtype_class):
+    def mock_issubdtype(dtype, dtype_class):  # type: ignore
         # Return False for all combinations to force the unsupported dtype path
         return False
         
@@ -103,14 +103,16 @@ def test_arrow_batch_to_tensor_dict_dtype_conversion() -> None:
     float_array = pa.array([1.1, 2.2, None], type=pa.float32())
     double_array = pa.array([1.11, 2.22, None], type=pa.float64())
     
+    schema_list: list[pa.Field] = [
+        pa.field("int_col", pa.int32(), nullable=True),
+        pa.field("long_col", pa.int64(), nullable=True),
+        pa.field("float_col", pa.float32(), nullable=True),
+        pa.field("double_col", pa.float64(), nullable=True),
+    ]
+    
     rb = pa.RecordBatch.from_arrays(
         [int_array, long_array, float_array, double_array],
-        schema=pa.schema([
-            pa.field("int_col", pa.int32(), nullable=True),
-            pa.field("long_col", pa.int64(), nullable=True),
-            pa.field("float_col", pa.float32(), nullable=True),
-            pa.field("double_col", pa.float64(), nullable=True),
-        ])
+        schema=pa.schema(schema_list)
     )
     
     tensor_dict = _arrow_batch_to_tensor_dict(rb, schema)
@@ -122,19 +124,19 @@ def test_arrow_batch_to_tensor_dict_dtype_conversion() -> None:
     assert "double_col" in tensor_dict
     
     # Verify tensor shapes
-    assert tensor_dict["int_col"].shape == torch.Size([3])
-    assert tensor_dict["long_col"].shape == torch.Size([3])
-    assert tensor_dict["float_col"].shape == torch.Size([3])
-    assert tensor_dict["double_col"].shape == torch.Size([3])
+    assert tensor_dict["int_col"].shape == torch.Size([3])  # type: ignore
+    assert tensor_dict["long_col"].shape == torch.Size([3])  # type: ignore
+    assert tensor_dict["float_col"].shape == torch.Size([3])  # type: ignore
+    assert tensor_dict["double_col"].shape == torch.Size([3])  # type: ignore
     
     # Based on the actual implementation, integer arrays with nulls 
     # are converted to float32 (not int64)
-    assert tensor_dict["int_col"].dtype == torch.float32
-    assert tensor_dict["long_col"].dtype == torch.float32
+    assert tensor_dict["int_col"].dtype == torch.float32  # type: ignore
+    assert tensor_dict["long_col"].dtype == torch.float32  # type: ignore
     
     # Floating point datatypes should be float32
-    assert tensor_dict["float_col"].dtype == torch.float32
-    assert tensor_dict["double_col"].dtype == torch.float32
+    assert tensor_dict["float_col"].dtype == torch.float32  # type: ignore
+    assert tensor_dict["double_col"].dtype == torch.float32  # type: ignore
     
     # Check values (null values become NaN for all numeric types)
     assert tensor_dict["int_col"][0].item() == 1.0

@@ -8,6 +8,7 @@ import pyarrow as pa
 import torch
 
 from pyspark.sql import DataFrame
+from pyspark.sql.functions import rand
 from torch.utils.data import DataLoader, IterableDataset
 
 from caspi.torch.helpers import (
@@ -28,33 +29,93 @@ class SparkArrowBatchDataset(IterableDataset):
 
     Uses only public PySpark APIs (`mapInArrow`) to stream data efficiently
     and then converts the received Arrow batches into `TensorDict`s suitable
-    for PyTorch models.
+    for PyTorch models. It can optionally shuffle and/or repartition the
+    DataFrame at the beginning of each epoch.
 
     Attributes:
         _df: The source PySpark DataFrame.
         _spark_schema: The schema of the source DataFrame.
         _tokenizer: An optional callable used to tokenize string columns.
+        shuffle_per_epoch (bool): Whether to shuffle the DataFrame before each epoch.
+        repartition_num (int | None): Number of partitions for repartitioning
+            before each epoch.
+        repartition_cols (list[str] | None): Columns to use for repartitioning
+            before each epoch.
+        random_seed (int | None): Seed for shuffling for reproducibility. If set,
+            the shuffle order will be the same for every epoch. If None and
+            shuffle_per_epoch is True, shuffle order will be random each epoch.
     """
 
-    def __init__(self, df: DataFrame, tokenizer: Callable | None = None) -> None:
+    def __init__(
+        self, 
+        df: DataFrame, 
+        tokenizer: Callable | None = None,
+        shuffle_per_epoch: bool = False,
+        repartition_num: int | None = None,
+        repartition_cols: list[str] | None = None,
+        random_seed: int | None = None,
+    ) -> None:
         """Initializes the SparkArrowBatchDataset.
 
         Args:
             df (DataFrame): The source PySpark `DataFrame`.
             tokenizer (Callable | None): An optional tokenizer for StringType
-                columns. If provided, string columns will be tokenized and
-                represented as tensors based on the tokenizer's output.
+                columns.
+            shuffle_per_epoch (bool): If True, the DataFrame will be globally
+                shuffled before data is streamed for each epoch. Default is False.
+            repartition_num (int | None): If provided, the DataFrame will be
+                repartitioned to this many partitions before each epoch.
+            repartition_cols (list[str] | None): If provided, the DataFrame will
+                be repartitioned using these columns before each epoch. Can be
+                used with or without `repartition_num`.
+            random_seed (int | None): Seed for the random number generator used
+                in shuffling. If `shuffle_per_epoch` is True and `random_seed` is
+                set, the shuffle order will be identical across epochs. If None,
+                the shuffle will be different each epoch.
         """
 
         _validate_df_schema(df, timestamp_to="int64", tokenizer=tokenizer)
-        self._df = df
+        self._df = df  # Store the original DataFrame
         self._spark_schema = df.schema
         self._tokenizer = tokenizer
+        
+        self.shuffle_per_epoch = shuffle_per_epoch
+        self.repartition_num = repartition_num
+        self.repartition_cols = repartition_cols
+        self.random_seed = random_seed
+        # self._epoch_count = 0 # Optional: for more complex seed logic if needed
 
     def __iter__(self) -> Iterator[TensorDict]:
+        # This method is called by DataLoader at the start of each epoch.
+        # self._epoch_count += 1 # If varying seed based on epoch number
+
+        # Start with the original DataFrame for this epoch's operations
+        df_for_this_epoch = self._df
+
+        # 1. Apply per-epoch shuffling if configured
+        if self.shuffle_per_epoch:
+            # seed_for_epoch = self.random_seed
+            # if self.random_seed is not None and self._epoch_count > 1:
+            #     # Example of varying seed: makes shuffle different but reproducible
+            #     seed_for_epoch = self.random_seed + self._epoch_count -1 
+            
+            if self.random_seed is not None:
+                df_for_this_epoch = df_for_this_epoch.orderBy(rand(seed=self.random_seed))
+            else:
+                df_for_this_epoch = df_for_this_epoch.orderBy(rand())
+
+        # 2. Apply per-epoch repartitioning if configured
+        if self.repartition_num is not None and self.repartition_cols and len(self.repartition_cols) > 0:
+            df_for_this_epoch = df_for_this_epoch.repartition(self.repartition_num, *self.repartition_cols)
+        elif self.repartition_num is not None:
+            df_for_this_epoch = df_for_this_epoch.repartition(self.repartition_num)
+        elif self.repartition_cols and len(self.repartition_cols) > 0:
+            df_for_this_epoch = df_for_this_epoch.repartition(*self.repartition_cols)
+        
         # Convert PyArrow schema to string representation for Spark
         schema_str = str(_ARROW_BATCH_SCHEMA)
-        df_serialised = self._df.mapInArrow(_serialise_batches, schema_str)
+        # Use the potentially shuffled/repartitioned DataFrame for mapInArrow
+        df_serialised = df_for_this_epoch.mapInArrow(_serialise_batches, schema_str)
 
         for row in df_serialised.toLocalIterator():
             payload = row["batch"]
@@ -67,11 +128,7 @@ class SparkArrowBatchDataset(IterableDataset):
 
 class RebatchingDataset(IterableDataset):
     """Wraps an IterableDataset yielding TensorDicts to enforce a fixed batch size.
-
-    Pulls data from the source dataset, concatenates it, and yields
-    batches of the desired size. Handles the final partial batch.
-    If a device is specified, all tensors are moved to that device
-    before being yielded.
+    (No changes needed in this class for enhancement 1)
     """
 
     def __init__(
@@ -80,16 +137,6 @@ class RebatchingDataset(IterableDataset):
         batch_size: int,
         device: str | torch.device | None = None,
     ):
-        """Initialize the RebatchingDataset.
-
-        Args:
-            source_dataset: The underlying dataset yielding TensorDict batches
-                (e.g., SparkArrowBatchDataset).
-            batch_size: The desired fixed batch size to yield.
-            device (str | torch.device | None): Optional device to move tensors to.
-                If provided, all tensors in the yielded batches will be moved
-                to this device. Default is None (keep tensors on their original device).
-        """
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
         self.source_dataset = source_dataset
@@ -97,77 +144,62 @@ class RebatchingDataset(IterableDataset):
         self.device = device
 
     def __iter__(self) -> Iterator[TensorDict]:
-        """Iterate through the source dataset and yield fixed‑size batches.
-
-        The old implementation concatenated the entire buffer every time a new
-        batch arrived, causing O(N²) data movement.  This version keeps a deque
-        of incoming TensorDicts (`buffer_batches`) and splices only the rows
-        required for the next output batch, concatenating *once per yield*.
-        """
-        
         source_iter = iter(self.source_dataset)
         buffer_batches: deque[TensorDict] = deque()
         rows_in_buffer = 0
         source_exhausted = False
 
         while True:
-            # -------------------------------------------------------------- #
-            # Stage 1: TOP‑UP — keep pulling from the source until we have
-            #           enough rows to satisfy one full batch or the source
-            #           is exhausted.
-            # -------------------------------------------------------------- #
             while rows_in_buffer < self.batch_size and not source_exhausted:
                 try:
                     next_batch = next(source_iter)
                     if not next_batch:
-                        continue  # skip empty batches
+                        continue
                     buffer_batches.append(next_batch)
                     rows_in_buffer += _get_tensor_dict_rows(next_batch)
                 except StopIteration:
                     source_exhausted = True
                     break
 
-            # If we have no data left, exit
             if rows_in_buffer == 0 and source_exhausted:
                 break
 
-            # Stage 2: BUILD one output batch of size `yield_size`
             yield_size = min(self.batch_size, rows_in_buffer)
             rows_needed = yield_size
             to_concat: list[TensorDict] = []
 
-            # Consume from the front of buffer_batches until we've collected
-            # the requested number of rows.
             while rows_needed > 0 and buffer_batches:
                 head = buffer_batches[0]
                 head_rows = _get_tensor_dict_rows(head)
 
                 if head_rows <= rows_needed:
-                    # Use the whole head batch
                     to_concat.append(head)
                     buffer_batches.popleft()
                     rows_in_buffer -= head_rows
                     rows_needed -= head_rows
                 else:
-                    # Use a slice of the head batch
                     to_concat.append(_slice_tensor_dict(head, 0, rows_needed))
-                    # Replace head with its remainder (in‑place update)
                     buffer_batches[0] = _slice_tensor_dict(head, rows_needed, head_rows)
                     rows_in_buffer -= rows_needed
                     rows_needed = 0
-
-            # Concatenate the pieces *once* and yield
+            
             output_batch: TensorDict = {}
-            for piece in to_concat:
-                output_batch = _concatenate_tensor_dicts(output_batch, piece)
+            # Ensure to_concat is not empty before trying to concatenate
+            if to_concat:
+                # Initialize output_batch with the first item to ensure correct type handling
+                output_batch = to_concat[0]
+                for piece in to_concat[1:]:
+                    output_batch = _concatenate_tensor_dicts(output_batch, piece)
+            elif source_exhausted and rows_in_buffer == 0 : # No data to form a batch, and source is done
+                break
 
-            # Move the batch to the specified device if necessary
-            if self.device is not None:
+
+            if self.device is not None and output_batch: # Check output_batch is not empty
                 output_batch = _to_device(output_batch, self.device)
+            
+            if output_batch: # Only yield if the batch is not empty
+                yield output_batch
 
-            yield output_batch
-
-            # Terminate when no more data remains
             if source_exhausted and rows_in_buffer == 0:
                 break
 
@@ -178,55 +210,66 @@ def loader(
     tokenizer: Callable | None = None,
     device: str | torch.device | None = None,
     pin_memory: bool = False,
+    # --- New parameters for epoch management ---
+    shuffle_per_epoch: bool = False,
+    repartition_num: int | None = None,
+    repartition_cols: list[str] | None = None,
+    random_seed: int | None = None,
 ) -> DataLoader[TensorDict]:
     """Creates a PyTorch DataLoader from a PySpark DataFrame.
 
     This function sets up a data loading pipeline that:
     1. Uses `SparkArrowBatchDataset` to efficiently stream data from Spark
-       executors to the driver using `mapInArrow`.
+       executors to the driver using `mapInArrow`. This dataset can now
+       handle per-epoch shuffling and repartitioning of the Spark DataFrame.
     2. Wraps the stream with `RebatchingDataset` to ensure that the data is
        yielded in batches of the specified `batch_size`.
     3. Configures a `torch.utils.data.DataLoader` to manage the final data
-       stream, ready for consumption by a PyTorch model.
+       stream.
 
     Args:
         df (DataFrame): The PySpark DataFrame to load data from.
         batch_size (int): The desired number of rows in each batch yielded by
             the DataLoader.
-        tokenizer (Callable | None): An optional tokenizer function to process
-            StringType columns in the DataFrame. If provided, string columns
-            will be tokenized.
-        device (str | torch.device | None): Optional device to move tensors to
-            (e.g., "cuda:0", "cpu"). If provided, all tensors in the yielded 
-            batches will be moved to this device. Default is None (keep tensors 
-            on their original device).
+        tokenizer (Callable | None): An optional tokenizer for StringType columns.
+        device (str | torch.device | None): Optional device for output tensors.
         pin_memory (bool): If True, enables pin_memory for the DataLoader.
-            This can improve performance when transferring data to CUDA devices.
-            Default is False. Note that this option is ignored if `device` is
-            set to "cpu".
+        shuffle_per_epoch (bool): If True, the Spark DataFrame will be globally
+            shuffled before each epoch. Default is False.
+        repartition_num (Optional[int]): Number of partitions for repartitioning
+            the Spark DataFrame before each epoch.
+        repartition_cols (Optional[List[str]]): Columns to use for repartitioning
+            the Spark DataFrame before each epoch.
+        random_seed (Optional[int]): Seed for shuffling. If set with
+            `shuffle_per_epoch=True`, the shuffle order is the same each epoch.
+            If None, shuffle is random per epoch.
 
     Returns:
-        DataLoader[TensorDict]: A PyTorch DataLoader instance. It yields
-            dictionaries (`TensorDict`) where keys are column names (or derived
-            names for tokenized strings) and values are `torch.Tensor` or
-            `list[torch.Tensor]`. The batches produced will have `batch_size`
-            rows, except possibly the last one. Parallelism is handled by Spark,
-            so `num_workers` is set to 0. Shuffling is disabled due to the
-            distributed nature of the data source.
+        DataLoader[TensorDict]: A PyTorch DataLoader instance.
     """
     
-    spark_dataset = SparkArrowBatchDataset(df, tokenizer=tokenizer)
+    spark_dataset = SparkArrowBatchDataset(
+        df, 
+        tokenizer=tokenizer,
+        shuffle_per_epoch=shuffle_per_epoch,
+        repartition_num=repartition_num,
+        repartition_cols=repartition_cols,
+        random_seed=random_seed,
+    )
     rebatched_dataset = RebatchingDataset(spark_dataset, batch_size, device=device)
     
-    if device is None:
-        device = torch.device("cpu")
-    if isinstance(device, str): 
-        device = torch.device(device)
+    current_device = torch.device("cpu") # Default device if not specified
+    if device is not None:
+        if isinstance(device, str): 
+            current_device = torch.device(device)
+        else:
+            current_device = device
+
 
     return DataLoader(
         rebatched_dataset,
-        batch_size=None,  # Batching is done by RebatchingDataset
-        shuffle=False,  # Shuffling is complex with distributed source
-        num_workers=0,  # Parallelism handled by Spark
-        pin_memory=pin_memory if device.type != "cpu" else False,
+        batch_size=None,
+        shuffle=False,  # Shuffling is handled by SparkArrowBatchDataset at the Spark level
+        num_workers=0,
+        pin_memory=pin_memory if current_device.type != "cpu" else False,
     )
