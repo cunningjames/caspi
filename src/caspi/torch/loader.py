@@ -1,17 +1,18 @@
 """PyTorch loader interface for Spark DataFrames."""
-
 from collections import deque
 from collections.abc import Iterator
-from typing import Callable
+from typing import Callable, Any
 
+import queue
+import threading
 import pyarrow as pa
 import torch
-
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import rand
 from torch.utils.data import DataLoader, IterableDataset
 
 from caspi.torch.helpers import (
+    _ARROW_BATCH_SCHEMA,
     TensorDict,
     _arrow_batch_to_tensor_dict,
     _concatenate_tensor_dicts,
@@ -20,8 +21,205 @@ from caspi.torch.helpers import (
     _slice_tensor_dict,
     _to_device,
     _validate_df_schema,
-    _ARROW_BATCH_SCHEMA,
 )
+
+_PREFETCH_SENTINEL = object()
+
+
+class BatchPrefetchDataset(IterableDataset):
+    """An IterableDataset that prefetches batches from a source dataset.
+
+    This dataset uses a worker thread to load batches from the `source_dataset`
+    into a queue, allowing the main thread to consume batches without waiting
+    for I/O operations.
+
+    Attributes:
+        source_dataset (IterableDataset[TensorDict]): The dataset from which
+            to prefetch batches.
+        max_queue_size (int): The maximum number of batches to store in the
+            prefetch queue.
+        device (str | torch.device | None): The target device for the prefetched
+            batches. If None, batches are not moved to a specific device by
+            this dataset.
+    """
+
+    def __init__(
+        self,
+        source_dataset: IterableDataset[TensorDict],
+        max_queue_size: int,
+        device: str | torch.device | None = None,
+    ):
+        """Initializes the BatchPrefetchDataset.
+
+        Args:
+            source_dataset (IterableDataset[TensorDict]): The dataset from which
+                to prefetch batches.
+            max_queue_size (int): The maximum number of batches to store in the
+                prefetch queue. Must be a positive integer.
+            device (str | torch.device | None): The target device for the
+                prefetched batches. If None, batches are not moved.
+
+        Raises:
+            ValueError: If `max_queue_size` is not positive.
+        """
+        
+        if max_queue_size <= 0:
+            raise ValueError("max_queue_size must be positive.")
+        self.source_dataset = source_dataset
+        self.max_queue_size = max_queue_size
+        self.device = device  # Target device for batches from this dataset
+
+        self._queue: queue.Queue[Any] | None = None
+        self._worker_thread: threading.Thread | None = None
+        self._stop_event: threading.Event | None = None
+
+    def _worker_fn(self) -> None:
+        """The target function for the prefetching worker thread.
+
+        This method iterates over the `source_dataset`, fetches batches, and
+        puts them into the internal queue. It handles `StopIteration` to signal
+        the end of an epoch and forwards any other exceptions to the main thread
+        via the queue.
+        """
+        
+        try:
+            # Each call to __iter__ on source_dataset should yield a fresh iterator
+            source_iter = iter(self.source_dataset)
+
+            assert self._queue is not None, "Queue should be initialized in __iter__"
+            assert self._stop_event is not None, (
+                "Stop event should be initialized in __iter__"
+            )
+
+            while not self._stop_event.is_set():
+                try:
+                    batch = next(source_iter)
+                    self._queue.put(batch, block=True, timeout=5)
+                except StopIteration:
+                    self._queue.put(
+                        _PREFETCH_SENTINEL
+                    )  # Signal end of data for this epoch
+                    return
+                except queue.Full:
+                    if self._stop_event.is_set():
+                        return
+                    continue
+                except Exception as e:
+                    self._queue.put(e)
+                    return
+        except Exception as e:
+            if self._queue:
+                self._queue.put(e)
+        finally:
+            # Might have to place sentinel if the worker exits unexpectedly to prevent
+            # the main thread from hanging indefinitely. The timeout in queue.get()
+            # should account for this, however.
+            pass
+
+    def __iter__(self) -> Iterator[TensorDict]:
+        """Returns an iterator for the dataset.
+
+        Initializes the prefetching queue, stop event, and starts the worker
+        thread. If a worker thread from a previous iteration is still active,
+        it's cleaned up first.
+
+        Returns:
+            Iterator[TensorDict]: An iterator yielding prefetched tensor dictionaries.
+        """
+        
+        if self._worker_thread is not None and self._worker_thread.is_alive():
+            self._cleanup_worker()
+
+        self._queue = queue.Queue(maxsize=self.max_queue_size)
+        self._stop_event = threading.Event()
+
+        self._worker_thread = threading.Thread(target=self._worker_fn, daemon=True)
+        self._worker_thread.start()
+
+        return self
+
+    def __next__(self) -> TensorDict:
+        """Retrieves the next batch from the prefetch queue.
+
+        Blocks until a batch is available or a timeout occurs. Handles the
+        sentinel object to signal `StopIteration` and raises any exceptions
+        propagated from the worker thread. If a target device is specified,
+        the batch is moved to that device before being returned.
+
+        Returns:
+            TensorDict: The next batch of data.
+
+        Raises:
+            RuntimeError: If the iterator is not initialized (i.e., `__iter__`
+                has not been called) or if the worker thread dies unexpectedly.
+            TimeoutError: If waiting for a batch from the queue times out.
+            StopIteration: When all batches for the current epoch have been consumed.
+            Exception: Any exception raised by the `source_dataset` during iteration
+                or batch processing.
+        """
+        
+        if self._queue is None:
+            raise RuntimeError(
+                "Iterator not initialized. Call iter() on BatchPrefetchDataset first."
+            )
+
+        try:
+            # Block until an item is available or timeout
+            item = self._queue.get(block=True, timeout=120)  # e.g., 2 min timeout
+        except queue.Empty:
+            if self._worker_thread is not None and not self._worker_thread.is_alive():
+                raise RuntimeError(
+                    "Prefetch worker thread died or exited unexpectedly."
+                )
+            else:  # Worker might be slow or stuck
+                raise TimeoutError(
+                    "Timeout waiting for batch from prefetch queue. "
+                    "Worker may be slow, stuck, or an error occurred in the worker."
+                )
+
+        if item is _PREFETCH_SENTINEL:
+            self._cleanup_worker()  # Normal end of epoch, join thread
+            raise StopIteration
+
+        if isinstance(item, Exception):
+            self._cleanup_worker()
+            raise item
+
+        # If we are here, item is a TensorDict. Move to device if specified.
+        if self.device is not None:
+            item = _to_device(item, self.device)
+
+        return item  # type: ignore
+
+    def _cleanup_worker(self) -> None:
+        """Cleans up the worker thread and associated resources.
+
+        Signals the worker thread to stop, clears the queue, and joins the
+        thread with a timeout. Resets internal state related to the worker.
+        """
+        
+        if self._worker_thread is not None:
+            if self._stop_event:
+                self._stop_event.set()
+
+            if self._queue:
+                while not self._queue.empty():
+                    try:
+                        self._queue.get_nowait()
+                    except queue.Empty:
+                        break
+
+            self._worker_thread.join(timeout=10)
+            if self._worker_thread.is_alive():
+                print("Warning: Prefetch worker thread did not terminate cleanly.")
+
+        self._worker_thread = None
+        self._queue = None
+        self._stop_event = None
+
+    def __del__(self) -> None:
+        """Ensures the worker thread is cleaned up when the dataset is deleted."""
+        self._cleanup_worker()
 
 
 class SparkArrowBatchDataset(IterableDataset):
@@ -47,13 +245,14 @@ class SparkArrowBatchDataset(IterableDataset):
     """
 
     def __init__(
-        self, 
-        df: DataFrame, 
+        self,
+        df: DataFrame,
         tokenizer: Callable | None = None,
         shuffle_per_epoch: bool = False,
         repartition_num: int | None = None,
         repartition_cols: list[str] | None = None,
         random_seed: int | None = None,
+        cache: bool = False,
     ) -> None:
         """Initializes the SparkArrowBatchDataset.
 
@@ -72,49 +271,58 @@ class SparkArrowBatchDataset(IterableDataset):
                 in shuffling. If `shuffle_per_epoch` is True and `random_seed` is
                 set, the shuffle order will be identical across epochs. If None,
                 the shuffle will be different each epoch.
+            cache (bool): If True, caches the DataFrame in memory. Default is False.
         """
 
         _validate_df_schema(df, timestamp_to="int64", tokenizer=tokenizer)
-        self._df = df  # Store the original DataFrame
+        self._df = df
         self._spark_schema = df.schema
         self._tokenizer = tokenizer
-        
+
         self.shuffle_per_epoch = shuffle_per_epoch
         self.repartition_num = repartition_num
         self.repartition_cols = repartition_cols
         self.random_seed = random_seed
-        # self._epoch_count = 0 # Optional: for more complex seed logic if needed
+        self._epoch_count = 0
+        self.cache = cache
+
+        if cache:
+            self._df = self._df.cache()
+
+            if repartition_num is not None or repartition_cols:
+                raise ValueError(
+                    "Caching the DataFrame and using repartitioning is not "
+                    "supported. Please set cache=False or avoid using repartition_num/"
+                    "repartition_cols."
+                )
 
     def __iter__(self) -> Iterator[TensorDict]:
-        # This method is called by DataLoader at the start of each epoch.
-        # self._epoch_count += 1 # If varying seed based on epoch number
+        self._epoch_count += 1
 
-        # Start with the original DataFrame for this epoch's operations
         df_for_this_epoch = self._df
 
-        # 1. Apply per-epoch shuffling if configured
         if self.shuffle_per_epoch:
-            # seed_for_epoch = self.random_seed
-            # if self.random_seed is not None and self._epoch_count > 1:
-            #     # Example of varying seed: makes shuffle different but reproducible
-            #     seed_for_epoch = self.random_seed + self._epoch_count -1 
-            
             if self.random_seed is not None:
-                df_for_this_epoch = df_for_this_epoch.orderBy(rand(seed=self.random_seed))
+                seed_for_epoch = self.random_seed + self._epoch_count
+                df_for_this_epoch = df_for_this_epoch.orderBy(rand(seed=seed_for_epoch))
             else:
                 df_for_this_epoch = df_for_this_epoch.orderBy(rand())
 
-        # 2. Apply per-epoch repartitioning if configured
-        if self.repartition_num is not None and self.repartition_cols and len(self.repartition_cols) > 0:
-            df_for_this_epoch = df_for_this_epoch.repartition(self.repartition_num, *self.repartition_cols)
+        if (
+            self.repartition_num is not None
+            and self.repartition_cols
+            and len(self.repartition_cols) > 0
+        ):
+            df_for_this_epoch = df_for_this_epoch.repartition(
+                self.repartition_num, *self.repartition_cols
+            )
         elif self.repartition_num is not None:
             df_for_this_epoch = df_for_this_epoch.repartition(self.repartition_num)
         elif self.repartition_cols and len(self.repartition_cols) > 0:
             df_for_this_epoch = df_for_this_epoch.repartition(*self.repartition_cols)
-        
-        # Convert PyArrow schema to string representation for Spark
+
         schema_str = str(_ARROW_BATCH_SCHEMA)
-        # Use the potentially shuffled/repartitioned DataFrame for mapInArrow
+
         df_serialised = df_for_this_epoch.mapInArrow(_serialise_batches, schema_str)
 
         for row in df_serialised.toLocalIterator():
@@ -128,22 +336,69 @@ class SparkArrowBatchDataset(IterableDataset):
 
 class RebatchingDataset(IterableDataset):
     """Wraps an IterableDataset yielding TensorDicts to enforce a fixed batch size.
-    (No changes needed in this class for enhancement 1)
+
+    This dataset consumes batches from a `source_dataset` (which may have
+    variable batch sizes) and re-batches them into `TensorDict`s of a
+    specified, fixed `batch_size`. It handles cases where source batches
+    need to be split or concatenated to form the target batch size.
+
+    Attributes:
+        source_dataset (IterableDataset[TensorDict]): The underlying dataset
+            from which to draw batches.
+        batch_size (int): The desired number of rows in each output batch.
+        device (str | torch.device | None): The target device for output batches.
+            If None, batches are not moved.
+        batch_transform_fn (Callable[[TensorDict], TensorDict] | None): An
+            optional function to apply to each re-batched `TensorDict` before
+            it is yielded.
     """
 
     def __init__(
-        self, 
-        source_dataset: IterableDataset[TensorDict], 
+        self,
+        source_dataset: IterableDataset[TensorDict],
         batch_size: int,
         device: str | torch.device | None = None,
+        batch_transform_fn: Callable[[TensorDict], TensorDict] | None = None,
     ):
+        """Initializes the RebatchingDataset.
+
+        Args:
+            source_dataset (IterableDataset[TensorDict]): The dataset from which
+                to draw and re-batch data.
+            batch_size (int): The target number of rows for each output batch.
+                Must be a positive integer.
+            device (str | torch.device | None): If specified, output batches
+                will be moved to this device.
+            batch_transform_fn (Callable[[TensorDict], TensorDict] | None):
+                An optional function to transform each `TensorDict` after
+                re-batching and before device placement.
+
+        Raises:
+            ValueError: If `batch_size` is not positive.
+        """
+        
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
         self.source_dataset = source_dataset
         self.batch_size = batch_size
         self.device = device
+        self.batch_transform_fn = batch_transform_fn
 
     def __iter__(self) -> Iterator[TensorDict]:
+        """Returns an iterator that yields re-batched TensorDicts.
+
+        This iterator pulls data from the `source_dataset`, buffers it, and
+        constructs new batches of `self.batch_size`. It handles partial batches
+        at the end of the `source_dataset` iteration. If a `batch_transform_fn`
+        is provided, it's applied to each batch. If a `device` is set, batches
+        are moved to that device before being yielded.
+
+        Yields:
+            Iterator[TensorDict]: An iterator of `TensorDict`s, each containing
+                `batch_size` rows (or fewer for the last batch if the total
+                number of rows is not a multiple of `batch_size`).
+        """
+        
         source_iter = iter(self.source_dataset)
         buffer_batches: deque[TensorDict] = deque()
         rows_in_buffer = 0
@@ -182,22 +437,27 @@ class RebatchingDataset(IterableDataset):
                     buffer_batches[0] = _slice_tensor_dict(head, rows_needed, head_rows)
                     rows_in_buffer -= rows_needed
                     rows_needed = 0
-            
+
             output_batch: TensorDict = {}
             # Ensure to_concat is not empty before trying to concatenate
             if to_concat:
-                # Initialize output_batch with the first item to ensure correct type handling
                 output_batch = to_concat[0]
                 for piece in to_concat[1:]:
                     output_batch = _concatenate_tensor_dicts(output_batch, piece)
-            elif source_exhausted and rows_in_buffer == 0 : # No data to form a batch, and source is done
+            elif (
+                source_exhausted and rows_in_buffer == 0
+            ):  # No data to form a batch, and source is done
                 break
 
+            if self.batch_transform_fn:
+                output_batch = self.batch_transform_fn(output_batch)
 
-            if self.device is not None and output_batch: # Check output_batch is not empty
+            if (
+                self.device is not None and output_batch
+            ):  # Check output_batch is not empty
                 output_batch = _to_device(output_batch, self.device)
-            
-            if output_batch: # Only yield if the batch is not empty
+
+            if output_batch:  # Only yield if the batch is not empty
                 yield output_batch
 
             if source_exhausted and rows_in_buffer == 0:
@@ -210,11 +470,13 @@ def loader(
     tokenizer: Callable | None = None,
     device: str | torch.device | None = None,
     pin_memory: bool = False,
-    # --- New parameters for epoch management ---
     shuffle_per_epoch: bool = False,
     repartition_num: int | None = None,
     repartition_cols: list[str] | None = None,
     random_seed: int | None = None,
+    batch_transform_fn: Callable[[TensorDict], TensorDict] | None = None,
+    cache: bool = False,
+    prefetch_queue_size: int | None = None,
 ) -> DataLoader[TensorDict]:
     """Creates a PyTorch DataLoader from a PySpark DataFrame.
 
@@ -243,33 +505,62 @@ def loader(
         random_seed (Optional[int]): Seed for shuffling. If set with
             `shuffle_per_epoch=True`, the shuffle order is the same each epoch.
             If None, shuffle is random per epoch.
+        batch_transform_fn (Callable[[TensorDict], TensorDict] | None): An optional
+            function to transform each batch of data. This function should take
+            a `TensorDict` as input and return a transformed `TensorDict`.
+        cache (bool): If True, caches the DataFrame in memory. Default is False.
 
     Returns:
         DataLoader[TensorDict]: A PyTorch DataLoader instance.
     """
-    
+
     spark_dataset = SparkArrowBatchDataset(
-        df, 
+        df,
         tokenizer=tokenizer,
         shuffle_per_epoch=shuffle_per_epoch,
         repartition_num=repartition_num,
         repartition_cols=repartition_cols,
         random_seed=random_seed,
+        cache=cache,
     )
-    rebatched_dataset = RebatchingDataset(spark_dataset, batch_size, device=device)
-    
-    current_device = torch.device("cpu") # Default device if not specified
-    if device is not None:
-        if isinstance(device, str): 
-            current_device = torch.device(device)
-        else:
-            current_device = device
 
+    # If prefetching is used, RebatchingDataset should output CPU tensors.
+    # The BatchPrefetchDataset will then handle the final move to device.
+    rebatching_device = (
+        None if (prefetch_queue_size and prefetch_queue_size > 0) else device
+    )
+
+    rebatched_dataset = RebatchingDataset(
+        spark_dataset,
+        batch_size,
+        device=rebatching_device,
+        batch_transform_fn=batch_transform_fn,
+    )
+
+    final_dataset_for_loader: RebatchingDataset | BatchPrefetchDataset = (
+        rebatched_dataset
+    )
+    if prefetch_queue_size is not None and prefetch_queue_size > 0:
+        # BatchPrefetchDataset wraps the rebatched_dataset and handles final device move
+        final_dataset_for_loader = BatchPrefetchDataset(
+            rebatched_dataset,
+            prefetch_queue_size,
+            device=device,  # The final target device
+        )
+
+    # Determine device for pin_memory setting
+    actual_device_obj = torch.device("cpu")
+    if device is not None:
+        if isinstance(device, str):
+            actual_device_obj = torch.device(device)
+        else:
+            actual_device_obj = device
 
     return DataLoader(
-        rebatched_dataset,
+        final_dataset_for_loader,
         batch_size=None,
-        shuffle=False,  # Shuffling is handled by SparkArrowBatchDataset at the Spark level
+        shuffle=False,
         num_workers=0,
-        pin_memory=pin_memory if current_device.type != "cpu" else False,
+        pin_memory=pin_memory if actual_device_obj.type != "cpu" else False,
+        # persistent_workers=False # (if num_workers > 0, consider this)
     )
