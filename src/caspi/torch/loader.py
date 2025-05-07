@@ -1,6 +1,7 @@
 """PyTorch loader interface for Spark DataFrames."""
 from collections import deque
 from collections.abc import Iterator
+import warnings
 from typing import Callable, Any
 
 import queue
@@ -41,6 +42,7 @@ class BatchPrefetchDataset(IterableDataset):
         device (str | torch.device | None): The target device for the prefetched
             batches. If None, batches are not moved to a specific device by
             this dataset.
+        timeout (int): The maximum time to wait for a batch from the queue.
     """
 
     def __init__(
@@ -48,6 +50,7 @@ class BatchPrefetchDataset(IterableDataset):
         source_dataset: IterableDataset[TensorDict],
         max_queue_size: int,
         device: str | torch.device | None = None,
+        timeout: int = 120,
     ):
         """Initializes the BatchPrefetchDataset.
 
@@ -58,6 +61,8 @@ class BatchPrefetchDataset(IterableDataset):
                 prefetch queue. Must be a positive integer.
             device (str | torch.device | None): The target device for the
                 prefetched batches. If None, batches are not moved.
+            timeout (int): The maximum time to wait for a batch from the queue.
+                Default is 120 seconds.
 
         Raises:
             ValueError: If `max_queue_size` is not positive.
@@ -67,11 +72,12 @@ class BatchPrefetchDataset(IterableDataset):
             raise ValueError("max_queue_size must be positive.")
         self.source_dataset = source_dataset
         self.max_queue_size = max_queue_size
-        self.device = device  # Target device for batches from this dataset
+        self.device = device
 
         self._queue: queue.Queue[Any] | None = None
         self._worker_thread: threading.Thread | None = None
         self._stop_event: threading.Event | None = None
+        self._timeout = timeout
 
     def _worker_fn(self) -> None:
         """The target function for the prefetching worker thread.
@@ -83,7 +89,6 @@ class BatchPrefetchDataset(IterableDataset):
         """
         
         try:
-            # Each call to __iter__ on source_dataset should yield a fresh iterator
             source_iter = iter(self.source_dataset)
 
             assert self._queue is not None, "Queue should be initialized in __iter__"
@@ -164,8 +169,7 @@ class BatchPrefetchDataset(IterableDataset):
             )
 
         try:
-            # Block until an item is available or timeout
-            item = self._queue.get(block=True, timeout=120)  # e.g., 2 min timeout
+            item = self._queue.get(block=True, timeout=self._timeout)
         except queue.Empty:
             if self._worker_thread is not None and not self._worker_thread.is_alive():
                 raise RuntimeError(
@@ -211,7 +215,10 @@ class BatchPrefetchDataset(IterableDataset):
 
             self._worker_thread.join(timeout=10)
             if self._worker_thread.is_alive():
-                print("Warning: Prefetch worker thread did not terminate cleanly.")
+                warnings.warn(
+                    "Prefetch worker thread did not terminate cleanly.",
+                    RuntimeWarning,
+                )
 
         self._worker_thread = None
         self._queue = None
@@ -439,25 +446,21 @@ class RebatchingDataset(IterableDataset):
                     rows_needed = 0
 
             output_batch: TensorDict = {}
-            # Ensure to_concat is not empty before trying to concatenate
+
             if to_concat:
                 output_batch = to_concat[0]
                 for piece in to_concat[1:]:
                     output_batch = _concatenate_tensor_dicts(output_batch, piece)
-            elif (
-                source_exhausted and rows_in_buffer == 0
-            ):  # No data to form a batch, and source is done
+            elif source_exhausted and rows_in_buffer == 0:
                 break
 
             if self.batch_transform_fn:
                 output_batch = self.batch_transform_fn(output_batch)
 
-            if (
-                self.device is not None and output_batch
-            ):  # Check output_batch is not empty
+            if self.device is not None and output_batch:
                 output_batch = _to_device(output_batch, self.device)
 
-            if output_batch:  # Only yield if the batch is not empty
+            if output_batch:
                 yield output_batch
 
             if source_exhausted and rows_in_buffer == 0:
@@ -524,8 +527,6 @@ def loader(
         cache=cache,
     )
 
-    # If prefetching is used, RebatchingDataset should output CPU tensors.
-    # The BatchPrefetchDataset will then handle the final move to device.
     rebatching_device = (
         None if (prefetch_queue_size and prefetch_queue_size > 0) else device
     )
@@ -541,14 +542,12 @@ def loader(
         rebatched_dataset
     )
     if prefetch_queue_size is not None and prefetch_queue_size > 0:
-        # BatchPrefetchDataset wraps the rebatched_dataset and handles final device move
         final_dataset_for_loader = BatchPrefetchDataset(
             rebatched_dataset,
             prefetch_queue_size,
-            device=device,  # The final target device
+            device=device,
         )
 
-    # Determine device for pin_memory setting
     actual_device_obj = torch.device("cpu")
     if device is not None:
         if isinstance(device, str):
@@ -562,5 +561,4 @@ def loader(
         shuffle=False,
         num_workers=0,
         pin_memory=pin_memory if actual_device_obj.type != "cpu" else False,
-        # persistent_workers=False # (if num_workers > 0, consider this)
     )
