@@ -1,4 +1,5 @@
 """PyTorch loader interface for Spark DataFrames."""
+
 from collections import deque
 from collections.abc import Iterator
 import warnings
@@ -292,6 +293,9 @@ class SparkArrowBatchDataset(IterableDataset):
         self.random_seed = random_seed
         self._epoch_count = 0
         self.cache = cache
+        
+        if not shuffle_per_epoch and random_seed is not None:
+            self._df = self._df.orderBy(rand(seed=random_seed))
 
         if cache:
             self._df = self._df.cache()
@@ -307,7 +311,7 @@ class SparkArrowBatchDataset(IterableDataset):
         self._epoch_count += 1
 
         df_for_this_epoch = self._df
-
+        
         if self.shuffle_per_epoch:
             if self.random_seed is not None:
                 seed_for_epoch = self.random_seed + self._epoch_count

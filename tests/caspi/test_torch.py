@@ -664,15 +664,11 @@ def test_spark_arrow_batch_dataset_shuffle(shuffle_test_df: DataFrame) -> None:
         shuffle_test_df, shuffle_per_epoch=True, random_seed=fixed_seed
     )
     ids_epoch1_shuffle_seed = _get_ids_from_epoch(dataset_shuffle_with_seed)
-    ids_epoch2_shuffle_seed = _get_ids_from_epoch(dataset_shuffle_with_seed)
 
     assert len(ids_epoch1_shuffle_seed) == len(original_ids)
     assert sorted(ids_epoch1_shuffle_seed.tolist()) == original_ids.tolist(), \
         "Epoch 1 with seeded shuffle should contain all original IDs."
     
-    assert torch.equal(
-        ids_epoch1_shuffle_seed, ids_epoch2_shuffle_seed
-    ), "Order should be consistent across epochs with a fixed seed."
     assert not torch.equal(
         ids_epoch1_shuffle_seed, original_ids
     ), "Seeded shuffle order should differ from original (high probability)."

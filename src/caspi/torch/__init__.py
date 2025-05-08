@@ -12,13 +12,19 @@ from caspi.torch.helpers import (
     TensorDict,
     TensorBatch,
 )
-from caspi.torch.loader import loader, SparkArrowBatchDataset, RebatchingDataset
+from caspi.torch.loader import (
+    loader,
+    SparkArrowBatchDataset,
+    RebatchingDataset,
+    BatchPrefetchDataset,
+)
 
 __all__ = [
     # Main interface
     "loader",
     "SparkArrowBatchDataset",
     "RebatchingDataset",
+    "BatchPrefetchDataset",
     "TensorDict",
     "TensorBatch",
 ]
