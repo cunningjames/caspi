@@ -1,12 +1,15 @@
 """PyTorch loader interface for Spark DataFrames."""
 
-from collections import deque
-from collections.abc import Iterator
-import warnings
-from typing import Callable, Any
+from __future__ import annotations
 
 import queue
 import threading
+import warnings
+import weakref
+from collections import deque
+from collections.abc import Iterator
+from typing import Any, Callable
+
 import pyarrow as pa
 import torch
 from pyspark.sql import DataFrame
@@ -26,6 +29,45 @@ from caspi.torch.helpers import (
 )
 
 _PREFETCH_SENTINEL = object()
+
+
+def _worker_fn(self_proxy: BatchPrefetchDataset) -> None:
+    """Runs in the background thread. `self_proxy` is a weakref.proxy.
+    Any attempt to use it *after* the dataset is GCed raises ReferenceError,
+    which we treat as our signal to shut down.
+    """
+    
+    try:
+        source_iter = iter(self_proxy.source_dataset)
+        while True:
+            if self_proxy._stop_event is None or self_proxy._queue is None:
+                return
+            
+            if self_proxy._stop_event.is_set():
+                return
+
+            try:
+                batch = next(source_iter)
+            except StopIteration:
+                self_proxy._queue.put(_PREFETCH_SENTINEL)
+                return
+
+            while not self_proxy._stop_event.is_set():
+                try:
+                    self_proxy._queue.put(batch, timeout=1)
+                    break
+                except queue.Full:
+                    continue
+    except ReferenceError:
+        return
+    except Exception as e:
+        try:
+            if self_proxy._queue is None:
+                return
+
+            self_proxy._queue.put(e)
+        except ReferenceError:
+            pass
 
 
 class BatchPrefetchDataset(IterableDataset):
@@ -80,48 +122,6 @@ class BatchPrefetchDataset(IterableDataset):
         self._stop_event: threading.Event | None = None
         self._timeout = timeout
 
-    def _worker_fn(self) -> None:
-        """The target function for the prefetching worker thread.
-
-        This method iterates over the `source_dataset`, fetches batches, and
-        puts them into the internal queue. It handles `StopIteration` to signal
-        the end of an epoch and forwards any other exceptions to the main thread
-        via the queue.
-        """
-        
-        try:
-            source_iter = iter(self.source_dataset)
-
-            assert self._queue is not None, "Queue should be initialized in __iter__"
-            assert self._stop_event is not None, (
-                "Stop event should be initialized in __iter__"
-            )
-
-            while not self._stop_event.is_set():
-                try:
-                    batch = next(source_iter)
-                    self._queue.put(batch, block=True, timeout=5)
-                except StopIteration:
-                    self._queue.put(
-                        _PREFETCH_SENTINEL
-                    )  # Signal end of data for this epoch
-                    return
-                except queue.Full:
-                    if self._stop_event.is_set():
-                        return
-                    continue
-                except Exception as e:
-                    self._queue.put(e)
-                    return
-        except Exception as e:
-            if self._queue:
-                self._queue.put(e)
-        finally:
-            # Might have to place sentinel if the worker exits unexpectedly to prevent
-            # the main thread from hanging indefinitely. The timeout in queue.get()
-            # should account for this, however.
-            pass
-
     def __iter__(self) -> Iterator[TensorDict]:
         """Returns an iterator for the dataset.
 
@@ -138,8 +138,15 @@ class BatchPrefetchDataset(IterableDataset):
 
         self._queue = queue.Queue(maxsize=self.max_queue_size)
         self._stop_event = threading.Event()
+        
+        self_proxy = weakref.proxy(self)
 
-        self._worker_thread = threading.Thread(target=self._worker_fn, daemon=True)
+        # self._worker_thread = threading.Thread(target=self._worker_fn, daemon=True)
+        self._worker_thread = threading.Thread(
+            target=_worker_fn,
+            args=(self_proxy,),
+            daemon=True,
+        )
         self._worker_thread.start()
 
         return self
