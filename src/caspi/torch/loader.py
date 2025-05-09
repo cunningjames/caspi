@@ -121,6 +121,7 @@ class BatchPrefetchDataset(IterableDataset):
         self._worker_thread: threading.Thread | None = None
         self._stop_event: threading.Event | None = None
         self._timeout = timeout
+        self._exhausted: bool = False
 
     def __iter__(self) -> Iterator[TensorDict]:
         """Returns an iterator for the dataset.
@@ -138,6 +139,7 @@ class BatchPrefetchDataset(IterableDataset):
 
         self._queue = queue.Queue(maxsize=self.max_queue_size)
         self._stop_event = threading.Event()
+        self._exhausted = False # Reset exhausted flag for re-iteration
         
         self_proxy = weakref.proxy(self)
 
@@ -170,8 +172,12 @@ class BatchPrefetchDataset(IterableDataset):
             Exception: Any exception raised by the `source_dataset` during iteration
                 or batch processing.
         """
+        if self._exhausted:
+            raise StopIteration
         
         if self._queue is None:
+            # This case should ideally not be hit if __iter__ was called and _exhausted is False.
+            # However, keeping it for robustness. If hit, it implies incorrect iterator usage.
             raise RuntimeError(
                 "Iterator not initialized. Call iter() on BatchPrefetchDataset first."
             )
@@ -180,10 +186,12 @@ class BatchPrefetchDataset(IterableDataset):
             item = self._queue.get(block=True, timeout=self._timeout)
         except queue.Empty:
             if self._worker_thread is not None and not self._worker_thread.is_alive():
+                # Worker died and queue is empty. Mark as exhausted.
+                self._exhausted = True
                 raise RuntimeError(
                     "Prefetch worker thread died or exited unexpectedly."
                 )
-            else:  # Worker might be slow or stuck
+            else:  # Worker might be slow, stuck, or queue became empty before sentinel (legitimate timeout)
                 raise TimeoutError(
                     "Timeout waiting for batch from prefetch queue. "
                     "Worker may be slow, stuck, or an error occurred in the worker."
@@ -191,10 +199,12 @@ class BatchPrefetchDataset(IterableDataset):
 
         if item is _PREFETCH_SENTINEL:
             self._cleanup_worker()  # Normal end of epoch, join thread
+            self._exhausted = True
             raise StopIteration
 
         if isinstance(item, Exception):
             self._cleanup_worker()
+            self._exhausted = True # Mark as exhausted due to error from worker
             raise item
 
         # If we are here, item is a TensorDict. Move to device if specified.
