@@ -281,7 +281,7 @@ def _concatenate_tensor_dicts(dict1: TensorDict, dict2: TensorDict) -> TensorDic
                 # For tokenizer outputs (dictionaries), combine the lists
                 concatenated[key] = val1 + val2
             else:
-                # Harmonise devices for each tensor within the lists
+                # Harmonize devices for each tensor within the lists
                 target_device = (
                     val1[0].device
                     if val1
