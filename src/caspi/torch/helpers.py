@@ -1,7 +1,7 @@
 """Helper functions for PyTorch integration with Spark."""
 
 from collections.abc import Iterator
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import pyarrow as pa
@@ -466,18 +466,23 @@ def _to_device(tensor_dict: TensorDict, device: str | torch.device | None) -> Te
     if isinstance(device, str):
         device = torch.device(device)
 
+    def _move_item(item: Any) -> Any:
+        if isinstance(item, torch.Tensor):
+            return item.to(device)
+        if isinstance(item, dict):
+            return {k: _move_item(v) for k, v in item.items()}
+        if isinstance(item, list):
+            return [
+                _move_item(v) if isinstance(v, (torch.Tensor, dict, list)) else v
+                for v in item
+            ]
+        return item
+
     result: TensorDict = {}
     for key, value in tensor_dict.items():
-        if isinstance(value, torch.Tensor):
-            result[key] = value.to(device)
-        elif isinstance(value, list):
-            # Handle list of tensors
-            result[key] = [
-                t.to(device) if isinstance(t, torch.Tensor) else t
-                for t in value
-            ]
-        else:
+        if not isinstance(value, (torch.Tensor, list, dict)):
             raise TypeError(f"Unsupported type for moving to device: {type(value)}")
+        result[key] = _move_item(value)
 
     return result
 
