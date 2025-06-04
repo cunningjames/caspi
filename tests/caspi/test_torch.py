@@ -1313,6 +1313,20 @@ def test_to_device() -> None:
     assert cast(list, moved_mixed_list_dict["e"])[1] == "string"
     assert cast(list, moved_mixed_list_dict["e"])[2].device == target_device
 
+    # Test with list containing dictionaries of tensors
+    dict_list_dict: TensorDict = {
+        "f": [
+            {"x": torch.tensor([1], device=initial_device)},
+            {"y": torch.tensor([2, 3], device=initial_device)},
+        ]
+    }
+    moved_dict_list_dict = _to_device(dict_list_dict, target_device_str)
+    assert isinstance(moved_dict_list_dict["f"], list)
+    assert cast(dict, moved_dict_list_dict["f"][0])["x"].device == target_device
+    assert torch.equal(cast(dict, moved_dict_list_dict["f"][0])["x"], torch.tensor([1]))
+    assert cast(dict, moved_dict_list_dict["f"][1])["y"].device == target_device
+    assert torch.equal(cast(dict, moved_dict_list_dict["f"][1])["y"], torch.tensor([2, 3]))
+
 
 def test_serialise_batches() -> None:
     """Tests the _serialise_batches helper function.
