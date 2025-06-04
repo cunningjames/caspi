@@ -13,6 +13,7 @@ from typing import Any, Callable
 import pyarrow as pa
 import torch
 from pyspark.sql import DataFrame
+from pyspark.sql.pandas.types import to_arrow_schema
 from pyspark.sql.functions import rand
 from torch.utils.data import DataLoader, IterableDataset
 
@@ -353,12 +354,37 @@ class SparkArrowBatchDataset(IterableDataset):
 
         df_serialised = df_for_this_epoch.mapInArrow(_serialise_batches, schema_str)
 
-        for row in df_serialised.toLocalIterator():
-            payload = row["batch"]
-            stream = pa.ipc.open_stream(payload)
-            for record_batch in stream:
+        try:
+            for row in df_serialised.toLocalIterator():
+                payload = row["batch"]
+                stream = pa.ipc.open_stream(payload)
+                for record_batch in stream:
+                    yield _arrow_batch_to_tensor_dict(
+                        record_batch, self._spark_schema, self._tokenizer
+                    )
+        except Exception as e:  # pragma: no cover - fallback path
+            err_msg = str(e)
+            if "sun.misc.Unsafe" not in err_msg and "DirectByteBuffer" not in err_msg:
+                raise
+
+            rows = df_for_this_epoch.collect()
+            if not rows:
+                return
+
+            data = [r.asDict(recursive=True) for r in rows]
+            arrow_schema = to_arrow_schema(self._spark_schema)
+            table = pa.Table.from_pylist(data, schema=arrow_schema)
+
+            conf = self._df.sparkSession.conf
+            batch_size_str = conf.get("spark.sql.execution.arrow.maxRecordsPerBatch", "10000")
+            try:
+                batch_size = int(batch_size_str)
+            except ValueError:
+                batch_size = 10000
+
+            for rb in table.to_batches(max_chunksize=batch_size):
                 yield _arrow_batch_to_tensor_dict(
-                    record_batch, self._spark_schema, self._tokenizer
+                    rb, self._spark_schema, self._tokenizer
                 )
 
 
