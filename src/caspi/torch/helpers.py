@@ -54,8 +54,11 @@ def _arrow_batch_to_tensor_dict(
         TensorDict: A dictionary where keys are column names (or derived names
             for tokenized strings) and values are either `torch.Tensor` (for
             scalar types, timestamps, tokenized strings) or `list[torch.Tensor]`
-            (for array types). Returns an empty dictionary if the input
-            `record_batch` has zero rows.
+            (for arrays of numeric, boolean, or timestamp types). For string
+            arrays, each element of the list can instead be a dictionary
+            containing the tokenized tensors (e.g., ``{"input_ids": ..., "attention_mask": ...}``).
+            Returns an empty dictionary if the input `record_batch` has zero
+            rows.
 
     Raises:
         TypeError: If a column contains a data type that is not supported for
