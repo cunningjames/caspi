@@ -480,8 +480,25 @@ def _to_device(tensor_dict: TensorDict, device: str | torch.device | None) -> Te
 
     result: TensorDict = {}
     for key, value in tensor_dict.items():
-        if isinstance(value, (torch.Tensor, list, dict)):
-            result[key] = _move(value)
+        if isinstance(value, torch.Tensor):
+            result[key] = value.to(device)
+        elif isinstance(value, list):
+            # Handle list elements that may be tensors or dictionaries of tensors
+            converted_list: list[Any] = []
+            for item in value:
+                if isinstance(item, torch.Tensor):
+                    converted_list.append(item.to(device))
+                elif isinstance(item, dict):
+                    converted_dict: dict[str, Any] = {}
+                    for k, v in item.items():
+                        if isinstance(v, torch.Tensor):
+                            converted_dict[k] = v.to(device)
+                        else:
+                            converted_dict[k] = v
+                    converted_list.append(converted_dict)
+                else:
+                    converted_list.append(item)
+            result[key] = converted_list
         else:
             raise TypeError(f"Unsupported type for moving to device: {type(value)}")
 
