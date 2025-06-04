@@ -1,7 +1,7 @@
 """Helper functions for PyTorch integration with Spark."""
 
 from collections.abc import Iterator
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable
 
 import numpy as np
 import pyarrow as pa
@@ -54,8 +54,11 @@ def _arrow_batch_to_tensor_dict(
         TensorDict: A dictionary where keys are column names (or derived names
             for tokenized strings) and values are either `torch.Tensor` (for
             scalar types, timestamps, tokenized strings) or `list[torch.Tensor]`
-            (for array types). Returns an empty dictionary if the input
-            `record_batch` has zero rows.
+            (for arrays of numeric, boolean, or timestamp types). For string
+            arrays, each element of the list can instead be a dictionary
+            containing the tokenized tensors (e.g., ``{"input_ids": ..., "attention_mask": ...}``).
+            Returns an empty dictionary if the input `record_batch` has zero
+            rows.
 
     Raises:
         TypeError: If a column contains a data type that is not supported for
@@ -281,7 +284,7 @@ def _concatenate_tensor_dicts(dict1: TensorDict, dict2: TensorDict) -> TensorDic
                 # For tokenizer outputs (dictionaries), combine the lists
                 concatenated[key] = val1 + val2
             else:
-                # Harmonise devices for each tensor within the lists
+                # Harmonize devices for each tensor within the lists
                 target_device = (
                     val1[0].device
                     if val1
@@ -466,18 +469,20 @@ def _to_device(tensor_dict: TensorDict, device: str | torch.device | None) -> Te
     if isinstance(device, str):
         device = torch.device(device)
 
+    def _move_item(item: Any) -> Any:
+        if isinstance(item, torch.Tensor):
+            return item.to(device)
+        if isinstance(item, list):
+            return [_move_item(v) for v in item]
+        if isinstance(item, dict):
+            return {k: _move_item(v) for k, v in item.items()}
+        return item
+
     result: TensorDict = {}
     for key, value in tensor_dict.items():
-        if isinstance(value, torch.Tensor):
-            result[key] = value.to(device)
-        elif isinstance(value, list):
-            # Handle list of tensors
-            result[key] = [
-                t.to(device) if isinstance(t, torch.Tensor) else t
-                for t in value
-            ]
-        else:
+        if not isinstance(value, (torch.Tensor, list, dict)):
             raise TypeError(f"Unsupported type for moving to device: {type(value)}")
+        result[key] = _move_item(value)
 
     return result
 

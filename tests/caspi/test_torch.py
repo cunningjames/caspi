@@ -1313,6 +1313,20 @@ def test_to_device() -> None:
     assert cast(list, moved_mixed_list_dict["e"])[1] == "string"
     assert cast(list, moved_mixed_list_dict["e"])[2].device == target_device
 
+    # Test with list containing dictionaries of tensors
+    dict_list_dict: TensorDict = {
+        "f": [
+            {"x": torch.tensor([1], device=initial_device)},
+            {"y": torch.tensor([2, 3], device=initial_device)},
+        ]
+    }
+    moved_dict_list_dict = _to_device(dict_list_dict, target_device_str)
+    assert isinstance(moved_dict_list_dict["f"], list)
+    assert cast(dict, moved_dict_list_dict["f"][0])["x"].device == target_device
+    assert torch.equal(cast(dict, moved_dict_list_dict["f"][0])["x"], torch.tensor([1]))
+    assert cast(dict, moved_dict_list_dict["f"][1])["y"].device == target_device
+    assert torch.equal(cast(dict, moved_dict_list_dict["f"][1])["y"], torch.tensor([2, 3]))
+
 
 def test_serialise_batches() -> None:
     """Tests the _serialise_batches helper function.
@@ -1382,3 +1396,30 @@ def test_serialise_batches() -> None:
     with pa.ipc.open_stream(payload_gen2) as reader:
         deserialized_rb_gen2 = reader.read_all()
     assert deserialized_rb_gen2.equals(pa.Table.from_batches([original_rb_gen2]))
+
+
+def test_to_device_nested_tokenizer_dicts() -> None:
+    """Ensure _to_device moves tensors inside nested dictionaries."""
+    init_device = torch.device("cpu")
+    target = torch.device("cpu")
+
+    tokenized_list: list[dict[str, torch.Tensor]] = [
+        {
+            "input_ids": torch.tensor([1, 2], device=init_device),
+            "attention_mask": torch.tensor([1, 1], device=init_device),
+        },
+        {
+            "input_ids": torch.tensor([3], device=init_device),
+            "attention_mask": torch.tensor([1], device=init_device),
+        },
+    ]
+
+    tensor_dict: TensorDict = {"tokens": tokenized_list}
+
+    moved = _to_device(tensor_dict, target)
+    moved_list = cast(list[dict[str, torch.Tensor]], moved["tokens"])
+
+    for original, moved_dict in zip(tokenized_list, moved_list):
+        for key in original:
+            assert moved_dict[key].device == target
+            assert torch.equal(moved_dict[key], original[key])
